@@ -1,0 +1,8 @@
+[
+  {"steps": ["Spray drying", "Uniaxial pressing", "Conventional sintering", "Lapping and polishing", "Sputter coating"], "rationale": "Classic press-and-sinter route, gold sputtered."},
+  {"steps": ["Spark plasma sintering", "Lapping and polishing", "Sputter coating"], "rationale": "SPS skips granulation and pressing."},
+  {"steps": ["Spray drying", "Cold isostatic pressing", "Conventional sintering", "Lapping and polishing", "Sputter coating"], "rationale": "CIP gives more uniform green density."},
+  {"steps": ["Slip casting", "Conventional sintering", "Lapping and polishing", "Sol-gel dip coating"], "rationale": "Slip cast then oxide coat."},
+  {"steps": ["Spray drying", "Uniaxial pressing", "Hot pressing", "Lapping and polishing", "Sputter coating"], "rationale": "Hot pressing for higher density."},
+  {"steps": ["Spray drying", "Conventional sintering", "Lapping and polishing", "Sputter coating"], "rationale": "Broken chain example."}
+]
