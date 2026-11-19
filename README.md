@@ -165,6 +165,55 @@ Test the lab check alone with the example routes:
 python route_planner.py "print powder" "tensile test specimen" --candidates example_candidates.json --no-literature-check --show-rejected
 ```
 
+## Trace back from the end (every path, every machine)
+
+```bash
+python trace_back.py "Ti64 powder" "dogbone"
+```
+
+Works backwards from the end object: which actions in your lab produce it, and from what? Then
+the same for each of those inputs, back to the start. An action is "turn X into Y"; every piece
+of lab equipment that takes X and makes Y can do it, so the equipment is listed together per
+action. The verb comes from the papers (what they call that step), or the local AI names it.
+
+```
+12 different paths, 36 equipment combinations (8 runnable today)
+
+BACKWARD, from the end:
+  Tensile test specimen  <=  machining  <=  Specimen blank
+       by: CNC lathe   [8 papers]
+     Specimen blank  <=  cut from build plate  <=  As-built part
+          by: Band saw   [named by AI]
+     ...
+        Characterized powder  <=  powder characterization  <=  Print powder
+             by: Laser particle size analyzer, Scanning electron microscope (not accessible)
+
+PATHS, in working order, runnable and shortest first:
+  Path 1: 3 steps, 4 equipment combinations (1 runnable today)
+     1. powder characterization   Print powder -> Characterized powder
+                                  by: Laser particle size analyzer | Scanning electron microscope (x)
+     ...
+```
+
+- **"papers also use: X (in your lab, but not recorded as taking Y)"** means papers do this action
+  with equipment you have, but your lab data doesn't say it accepts that input. Check your lab data.
+- **"papers also use: X (not in your lab)"** is equipment you could buy, borrow or outsource.
+
+| flag | what it does |
+|---|---|
+| `--usable-only` | leave out equipment that isn't usable today |
+| `--show 10` | paths printed in full (default 5; the rest one line each) |
+| `--max-steps 15`, `--max-paths 500` | allow longer paths / count more of them |
+| `--verbs none` | don't use the AI to name actions (plain descriptions instead) |
+| `--json` | machine-readable: every path, step, verb and equipment option |
+
+View the latest trace in the Neo4j Browser:
+
+```cypher
+MATCH (bt:BackTrace)-[:HAS_ACTION]->(a:Action) WITH bt ORDER BY bt.createdAt DESC LIMIT 1
+MATCH (bt)-[:HAS_ACTION]->(a)-[r]-(x) RETURN a, r, x
+```
+
 ## What's in Neo4j
 
 ```
