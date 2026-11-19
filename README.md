@@ -91,16 +91,39 @@ Re-run it when you add equipment or papers. `python map_names.py --list` shows t
 python route_planner.py "print powder" "tensile test specimen" --start-desc "gas-atomized Ti-6Al-4V powder" --end-desc "ASTM E8 round specimen" --show-rejected
 ```
 
-You don't have to type your lab's exact names. If you type "titanium powder", the tool finds the
-closest name in your lab ("Print powder") and says so. If two names are about equally close, it
-asks you which one you mean. If nothing in your lab matches, or the literature can't connect your
-start and end, it tells you why and what you can do.
+### You don't have to type your lab's exact names
+
+The tool works out which of your lab's names you mean by its **role in the process**, not by
+shared words. Every lab noun has an operational profile built from Neo4j: what makes it, what
+takes it in, what comes before and after it, and what the papers call it. The free local model
+checks every word you typed and says what it tells about the object: material, form, stage or
+purpose. Then it picks the lab noun that is the same kind of object at the same stage.
+
+Specifics never decide the match: "Ti64 powder", "316L powder" and "gas-atomized powder 15-45 um"
+are all simply *powder*. As a start, that is your lab's raw powder ("Print powder"). The form
+(powder, bar, part, specimen, data) and the stage (as-received, printed, heat treated, machined,
+tested) decide.
+
+```
+Print powder  ->  Tensile test specimen
+  (start 'Ti64 powder', word by word: ti64 = material: Ti-6Al-4V (a detail); powder = form: powder)
+  (start: using your lab's 'Print powder' for 'Ti64 powder' (high confidence). ...)
+  (end 'dogbone', word by word: dogbone = form: dog-bone tensile specimen)
+  (end: using your lab's 'Tensile test specimen' for 'dogbone' (high confidence). ...)
+```
+
+When the model isn't sure, it asks you to choose. When nothing in your lab plays that role, it
+says so and lists your lab's names. If Ollama isn't running, it falls back to matching words and
+tells you.
 
 | flag | what it does |
 |---|---|
-| `--start-desc`, `--end-desc` | describe the start and end objects |
+| `--start-desc`, `--end-desc` | describe the start and end objects (also used for matching) |
+| `--match local` | match by operational role with the free local model (default) |
+| `--match claude` | the same with Claude (paid, more accurate) |
+| `--match words` | match by shared words only (fast, no AI) |
 | `--exact` | use start/end exactly as typed (no translation into lab names) |
-| `--yes` | never ask; take the closest lab name automatically |
+| `--yes` | never ask; take the best lab name automatically |
 | `--llm local` | also ask the free local model for suggestions (slower) |
 | `--llm claude` | also ask Claude for suggestions (paid; needs `ANTHROPIC_API_KEY`) |
 | `--show-rejected` | print rejected sequences in full, with the reasons |

@@ -27,7 +27,8 @@ import sys
 from pydantic import BaseModel, Field
 
 from common import database, get_driver, lucene_query, setup_schema
-from llm import CLAUDE_MODEL, OLLAMA_MODEL, EngineError, ask, check_local
+from llm import EngineError, ask, check_local
+from matching import resolve_endpoints
 
 
 class Step(BaseModel):
@@ -84,79 +85,6 @@ RETURN [t IN nodes(p) WHERE t:Transition | {{
           lab_output: [(t)-[:OUTPUTS]->(:LitNoun)<-[:SAME_AS]-(ln:Noun) | ln.name]
        }}] AS chain
 """
-
-
-# --------------------------------------------------------------------------
-# 0. Translate what you typed into your lab's names
-# --------------------------------------------------------------------------
-
-LAB_NOUN_EXACT = "MATCH (n:Noun) WHERE toLower(n.name) = toLower($t) RETURN n.name AS name"
-
-LAB_NOUN_SEARCH = """
-CALL db.index.fulltext.queryNodes('lab_noun_name', $q) YIELD node, score
-RETURN node.name AS name, score ORDER BY score DESC LIMIT 8
-"""
-
-# lab nouns linked (map_names.py) to literature nouns that resemble what was typed
-LAB_NOUN_VIA_LIT = """
-CALL db.index.fulltext.queryNodes('lit_noun_name', $q) YIELD node, score
-MATCH (n:Noun)-[:SAME_AS]->(node)
-RETURN n.name AS name, max(score) AS score
-"""
-
-NOUN_ROLE = """
-MATCH (n:Noun {name: $name})
-RETURN EXISTS { (:Equipment)-[:ACCEPTS]->(n) } AS accepted,
-       EXISTS { (:Equipment)-[:PRODUCES]->(n) } AS produced
-"""
-
-
-def resolve_lab_noun(session, typed: str, desc: str, role: str, ask_user: bool) -> tuple[str | None, str]:
-    """Find the lab noun meant by `typed`. Returns (lab name or None, note for the user)."""
-    exact = session.run(LAB_NOUN_EXACT, t=typed).single()
-    if exact:
-        return exact["name"], ""
-
-    scores: dict[str, float] = {}
-    for text in ([typed], [typed, desc]) if desc else ([typed],):
-        q = lucene_query(*text)
-        if not q:
-            continue
-        for r in session.run(LAB_NOUN_SEARCH, q=q):
-            scores[r["name"]] = max(scores.get(r["name"], 0), r["score"])
-        for r in session.run(LAB_NOUN_VIA_LIT, q=q):
-            scores[r["name"]] = scores.get(r["name"], 0) + 0.5 * r["score"]
-        if scores:
-            break  # the typed words alone were enough; don't let the description add noise
-    if not scores:
-        return None, ""
-
-    # small tie-breaker: a START is something the lab takes in; an END is something it produces
-    for name in scores:
-        role_row = session.run(NOUN_ROLE, name=name).single()
-        if role == "start" and role_row["accepted"] and not role_row["produced"]:
-            scores[name] += 0.01
-        if role == "end" and role_row["produced"] and not role_row["accepted"]:
-            scores[name] += 0.01
-    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
-    best, best_score = ranked[0]
-    close = [n for n, s in ranked[1:4] if s >= 0.85 * best_score]
-
-    if close and ask_user:
-        options = [best] + close
-        print(f"\n'{typed}' isn't a name in your lab. Which {role} did you mean?")
-        for i, n in enumerate(options, 1):
-            print(f"  {i}. {n}")
-        ans = input(f"Number (Enter = 1, q = quit): ").strip().lower()
-        if ans == "q":
-            sys.exit("Stopped.")
-        if ans.isdigit() and 1 <= int(ans) <= len(options):
-            best = options[int(ans) - 1]
-        return best, f"using your lab's '{best}' for '{typed}'"
-    note = f"using your lab's '{best}' for '{typed}'"
-    if close:
-        note += f" (other close matches: {', '.join(close)}; type the exact name to choose one)"
-    return best, note
 
 
 def lit_endpoints(session, name: str, desc: str) -> tuple[list[str], bool]:
@@ -411,7 +339,10 @@ def main() -> int:
     ap.add_argument("--candidates", help="JSON file of candidate sequences to check as well")
     ap.add_argument("--exact", action="store_true",
                     help="use start/end exactly as typed; don't translate them into your lab's names")
-    ap.add_argument("--yes", action="store_true", help="never ask; take the closest lab name automatically")
+    ap.add_argument("--match", choices=["local", "claude", "words"], default="local",
+                    help="how to translate start/end into lab names: local = free AI, checks every word "
+                         "and the operational role (default); claude = paid AI; words = shared words only")
+    ap.add_argument("--yes", action="store_true", help="never ask; take the best lab name automatically")
     ap.add_argument("--valid-only", action="store_true", help="list only valid candidates in the comparison")
     ap.add_argument("--show-rejected", action="store_true", help="also print rejected sequences in full")
     ap.add_argument("--no-literature-check", action="store_true",
@@ -441,19 +372,13 @@ def main() -> int:
         start, end, notes = args.start, args.end, []
         if not args.exact:
             ask_user = sys.stdin.isatty() and not args.yes and not args.json
-            missing = []
-            for role, typed, desc in (("start", args.start, args.start_desc), ("end", args.end, args.end_desc)):
-                name, note = resolve_lab_noun(session, typed, desc, role, ask_user)
-                if name is None:
-                    missing.append(typed)
-                    continue
-                if note:
-                    notes.append(note)
-                if role == "start":
-                    start = name
-                else:
-                    end = name
+            r_start, r_end, notes = resolve_endpoints(session, args.start, args.start_desc, args.end,
+                                                      args.end_desc, args.match, ask_user)
+            missing = [t for t, r in ((args.start, r_start), (args.end, r_end)) if r is None]
+            start, end = r_start or args.start, r_end or args.end
             if missing:
+                for note in notes:
+                    print(f"  ({note})")
                 nouns = [r["n"] for r in session.run("MATCH (n:Noun) RETURN n.name AS n ORDER BY n")]
                 print("\nNothing in your lab matches " + " or ".join(f"'{m}'" for m in missing) + ".\n"
                       "  Your lab's nouns are: " + ", ".join(nouns) + "\n"
