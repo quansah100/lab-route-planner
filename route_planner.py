@@ -116,7 +116,7 @@ WITH q, r, $routes[r] AS route
 CREATE (q)-[:FOUND {rank: r + 1}]->(rt:Route {steps: route.steps, rationale: route.rationale})
 WITH rt, route
 UNWIND range(0, size(route.steps) - 1) AS s
-MATCH (p:Process {name: route.steps[s]})
+MATCH (p:Process) WHERE toLower(p.name) = toLower(route.steps[s])
 CREATE (rt)-[:STEP {order: s + 1}]->(p)
 """
 

@@ -34,6 +34,20 @@ Load the example lab, or your own data using the same model (see the top of `see
 cypher-shell -u neo4j -p labpassword -f seed.cypher
 ```
 
+### Example 2: print powder → tensile test specimen (metal 3D printing)
+
+`seed_am_lab.cypher` adds a metal additive-manufacturing lab. It only adds data and does not delete anything:
+
+```bash
+docker exec -i neo4j-lab cypher-shell -u neo4j -p labpassword < seed_am_lab.cypher
+```
+
+```bash
+python route_planner.py "print powder" "tensile test specimen" --candidates example_am_candidates.json --show-rejected
+```
+
+Use `"tensile test results"` as the end material to include the tensile test itself as the last step.
+
 ## Run
 
 ```bash

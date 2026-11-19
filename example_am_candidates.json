@@ -1,0 +1,12 @@
+[
+  {"steps": ["Powder characterization", "Powder sieving", "Laser powder bed fusion", "Stress relief heat treatment", "CNC machining of tensile specimen"],
+   "rationale": "Standard LPBF route: qualify and sieve the powder, print, stress relieve, machine an E8 dog-bone."},
+  {"steps": ["Powder characterization", "Powder sieving", "Laser powder bed fusion", "Stress relief heat treatment", "Hot isostatic pressing", "CNC machining of tensile specimen"],
+   "rationale": "Adds HIP to close porosity before machining, for better fatigue and ductility."},
+  {"steps": ["Powder characterization", "Directed energy deposition", "Stress relief heat treatment", "CNC machining of tensile specimen"],
+   "rationale": "DED blanks are faster for large specimens."},
+  {"steps": ["Powder characterization", "Powder sieving", "Laser powder bed fusion", "Wire EDM specimen cutting"],
+   "rationale": "Cut flat specimens straight from the as-built part by wire EDM."},
+  {"steps": ["Powder characterization", "Powder sieving", "Laser powder bed fusion", "Shot peening", "CNC machining of tensile specimen"],
+   "rationale": "Shot peen the surface before machining."}
+]
