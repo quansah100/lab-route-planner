@@ -91,9 +91,16 @@ Re-run it when you add equipment or papers. `python map_names.py --list` shows t
 python route_planner.py "print powder" "tensile test specimen" --start-desc "gas-atomized Ti-6Al-4V powder" --end-desc "ASTM E8 round specimen" --show-rejected
 ```
 
+You don't have to type your lab's exact names. If you type "titanium powder", the tool finds the
+closest name in your lab ("Print powder") and says so. If two names are about equally close, it
+asks you which one you mean. If nothing in your lab matches, or the literature can't connect your
+start and end, it tells you why and what you can do.
+
 | flag | what it does |
 |---|---|
 | `--start-desc`, `--end-desc` | describe the start and end objects |
+| `--exact` | use start/end exactly as typed (no translation into lab names) |
+| `--yes` | never ask; take the closest lab name automatically |
 | `--llm local` | also ask the free local model for suggestions (slower) |
 | `--llm claude` | also ask Claude for suggestions (paid; needs `ANTHROPIC_API_KEY`) |
 | `--show-rejected` | print rejected sequences in full, with the reasons |

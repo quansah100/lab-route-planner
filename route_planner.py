@@ -86,6 +86,79 @@ RETURN [t IN nodes(p) WHERE t:Transition | {{
 """
 
 
+# --------------------------------------------------------------------------
+# 0. Translate what you typed into your lab's names
+# --------------------------------------------------------------------------
+
+LAB_NOUN_EXACT = "MATCH (n:Noun) WHERE toLower(n.name) = toLower($t) RETURN n.name AS name"
+
+LAB_NOUN_SEARCH = """
+CALL db.index.fulltext.queryNodes('lab_noun_name', $q) YIELD node, score
+RETURN node.name AS name, score ORDER BY score DESC LIMIT 8
+"""
+
+# lab nouns linked (map_names.py) to literature nouns that resemble what was typed
+LAB_NOUN_VIA_LIT = """
+CALL db.index.fulltext.queryNodes('lit_noun_name', $q) YIELD node, score
+MATCH (n:Noun)-[:SAME_AS]->(node)
+RETURN n.name AS name, max(score) AS score
+"""
+
+NOUN_ROLE = """
+MATCH (n:Noun {name: $name})
+RETURN EXISTS { (:Equipment)-[:ACCEPTS]->(n) } AS accepted,
+       EXISTS { (:Equipment)-[:PRODUCES]->(n) } AS produced
+"""
+
+
+def resolve_lab_noun(session, typed: str, desc: str, role: str, ask_user: bool) -> tuple[str | None, str]:
+    """Find the lab noun meant by `typed`. Returns (lab name or None, note for the user)."""
+    exact = session.run(LAB_NOUN_EXACT, t=typed).single()
+    if exact:
+        return exact["name"], ""
+
+    scores: dict[str, float] = {}
+    for text in ([typed], [typed, desc]) if desc else ([typed],):
+        q = lucene_query(*text)
+        if not q:
+            continue
+        for r in session.run(LAB_NOUN_SEARCH, q=q):
+            scores[r["name"]] = max(scores.get(r["name"], 0), r["score"])
+        for r in session.run(LAB_NOUN_VIA_LIT, q=q):
+            scores[r["name"]] = scores.get(r["name"], 0) + 0.5 * r["score"]
+        if scores:
+            break  # the typed words alone were enough; don't let the description add noise
+    if not scores:
+        return None, ""
+
+    # small tie-breaker: a START is something the lab takes in; an END is something it produces
+    for name in scores:
+        role_row = session.run(NOUN_ROLE, name=name).single()
+        if role == "start" and role_row["accepted"] and not role_row["produced"]:
+            scores[name] += 0.01
+        if role == "end" and role_row["produced"] and not role_row["accepted"]:
+            scores[name] += 0.01
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+    best, best_score = ranked[0]
+    close = [n for n, s in ranked[1:4] if s >= 0.85 * best_score]
+
+    if close and ask_user:
+        options = [best] + close
+        print(f"\n'{typed}' isn't a name in your lab. Which {role} did you mean?")
+        for i, n in enumerate(options, 1):
+            print(f"  {i}. {n}")
+        ans = input(f"Number (Enter = 1, q = quit): ").strip().lower()
+        if ans == "q":
+            sys.exit("Stopped.")
+        if ans.isdigit() and 1 <= int(ans) <= len(options):
+            best = options[int(ans) - 1]
+        return best, f"using your lab's '{best}' for '{typed}'"
+    note = f"using your lab's '{best}' for '{typed}'"
+    if close:
+        note += f" (other close matches: {', '.join(close)}; type the exact name to choose one)"
+    return best, note
+
+
 def lit_endpoints(session, name: str, desc: str) -> tuple[list[str], bool]:
     """Literature nouns for a start/end: the ones you matched in map_names.py, else a text search."""
     ids = session.run(MAPPED_NOUNS, name=name).single()["ids"]
@@ -95,17 +168,30 @@ def lit_endpoints(session, name: str, desc: str) -> tuple[list[str], bool]:
     return ([r["id"] for r in session.run(NOUN_SEARCH, q=q, k=3)] if q else []), False
 
 
-def graph_candidates(session, start: str, start_desc: str, end: str, end_desc: str,
-                     lab: dict[str, dict], per_pair: int, max_steps: int) -> list[Candidate]:
-    starts, s_mapped = lit_endpoints(session, start, start_desc)
-    ends, e_mapped = lit_endpoints(session, end, end_desc)
-    if not s_mapped or not e_mapped:
-        print("note: " + " and ".join(n for n, m in ((f"'{start}'", s_mapped), (f"'{end}'", e_mapped)) if not m)
-              + " not matched to the literature yet (map_names.py); using a text search instead.",
-              file=sys.stderr)
+REACHABLE_QUERY = """
+MATCH (a:LitNoun) WHERE elementId(a) IN $starts
+MATCH (a)(()-[:INPUT_OF]->(:Transition)-[:OUTPUTS]->()){{1,{hops}}}(b:LitNoun)
+WHERE b <> a
+RETURN DISTINCT b.name AS name LIMIT 12
+"""
+
+NAMES_QUERY = "MATCH (n:LitNoun) WHERE elementId(n) IN $ids RETURN collect(n.name) AS names"
+
+
+def graph_candidates(session, start: str, start_text: str, end: str, end_text: str,
+                     lab: dict[str, dict], per_pair: int, max_steps: int) -> tuple[list[Candidate], dict]:
+    """Literature chains from start to end. Also returns what was found, to explain an empty result."""
+    starts, s_mapped = lit_endpoints(session, start, start_text)
+    ends, e_mapped = lit_endpoints(session, end, end_text)
+    info = {"start_lit": session.run(NAMES_QUERY, ids=starts).single()["names"],
+            "end_lit": session.run(NAMES_QUERY, ids=ends).single()["names"],
+            "start_mapped": s_mapped, "end_mapped": e_mapped, "reachable": []}
     if not starts or not ends:
-        return []
-    rows = session.run(CHAINS_QUERY.format(k=int(per_pair), hops=int(max_steps)), starts=starts, ends=ends)
+        return [], info
+    rows = list(session.run(CHAINS_QUERY.format(k=int(per_pair), hops=int(max_steps)), starts=starts, ends=ends))
+    if not rows:
+        info["reachable"] = [r["name"] for r in session.run(REACHABLE_QUERY.format(hops=int(max_steps)),
+                                                            starts=starts)]
 
     merged: dict[tuple, Candidate] = {}
     for row in rows:
@@ -126,7 +212,31 @@ def graph_candidates(session, start: str, start_desc: str, end: str, end_desc: s
                                     "each step's output is the next step's input.", basis="")
     for c in merged.values():
         c.basis = "Papers: " + ", ".join(sorted({x for s in c.steps for x in s.citations}))
-    return list(merged.values())
+    return list(merged.values()), info
+
+
+def explain_empty(typed_start: str, typed_end: str, info: dict, max_steps: int) -> str:
+    """Plain-language reason why the literature gave no candidates."""
+    if not info["start_lit"] and not info["end_lit"]:
+        why = f"No paper in the library mentions anything like '{typed_start}' or '{typed_end}'."
+    elif not info["start_lit"]:
+        why = f"No paper in the library mentions anything like '{typed_start}'."
+    elif not info["end_lit"]:
+        why = f"No paper in the library mentions anything like '{typed_end}'."
+    else:
+        why = (f"The library has papers on '{typed_start}' (as: {', '.join(info['start_lit'])}) and on "
+               f"'{typed_end}' (as: {', '.join(info['end_lit'])}), but no chain of reported steps "
+               f"connects them within {max_steps} steps.")
+        if info["reachable"]:
+            why += f"\n  From '{typed_start}' the literature reaches: {', '.join(info['reachable'])}."
+        else:
+            why += f"\n  The literature has no steps that start from '{typed_start}'."
+    tips = ["harvest papers on this topic:  python harvest_literature.py --topic \"...\" --target 100"
+            "  (then extract_knowledge.py and map_names.py)",
+            "ask an AI to fill the gap:  add --llm local"]
+    if not info["start_mapped"] or not info["end_mapped"]:
+        tips.insert(0, "link your lab's names to the literature's:  python map_names.py")
+    return why + "\n  What you can do:\n" + "\n".join(f"    - {t}" for t in tips)
 
 
 def pick_equipment(options: list[str], incoming: str, lab: dict[str, dict]) -> str | None:
@@ -216,8 +326,8 @@ ORDER BY idx
 KNOWN_PAPERS = "MATCH (p:Paper) WHERE p.id IN $ids RETURN collect(p.id) AS ids"
 
 SAVE_QUERY = """
-CREATE (q:RouteQuery {start: $start, startDesc: $start_desc, end: $end, endDesc: $end_desc,
-                      createdAt: datetime()})
+CREATE (q:RouteQuery {start: $start, startTyped: $start_typed, startDesc: $start_desc,
+                      end: $end, endTyped: $end_typed, endDesc: $end_desc, createdAt: datetime()})
 WITH q
 UNWIND range(0, size($routes) - 1) AS r
 WITH q, r, $routes[r] AS route
@@ -288,8 +398,8 @@ def summary(start: str, cand: Candidate) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("start", help="what you start from, e.g. 'print powder'")
-    ap.add_argument("end", help="what you want to end with, e.g. 'tensile test specimen'")
+    ap.add_argument("start", help="what you start from, e.g. 'titanium powder'")
+    ap.add_argument("end", help="what you want to end with, e.g. 'tensile specimen'")
     ap.add_argument("--start-desc", default="", help="description of the start object")
     ap.add_argument("--end-desc", default="", help="description of the end object")
     ap.add_argument("--llm", choices=["none", "local", "claude"], default="none",
@@ -299,6 +409,9 @@ def main() -> int:
     ap.add_argument("--max-steps", type=int, default=10, help="longest literature chain to consider (default 10)")
     ap.add_argument("--per-pair", type=int, default=20, help="literature chains per start/end match (default 20)")
     ap.add_argument("--candidates", help="JSON file of candidate sequences to check as well")
+    ap.add_argument("--exact", action="store_true",
+                    help="use start/end exactly as typed; don't translate them into your lab's names")
+    ap.add_argument("--yes", action="store_true", help="never ask; take the closest lab name automatically")
     ap.add_argument("--valid-only", action="store_true", help="list only valid candidates in the comparison")
     ap.add_argument("--show-rejected", action="store_true", help="also print rejected sequences in full")
     ap.add_argument("--no-literature-check", action="store_true",
@@ -323,6 +436,33 @@ def main() -> int:
             print("No lab equipment with ACCEPTS/PRODUCES links in Neo4j. Load it first, e.g. with seed.cypher.",
                   file=sys.stderr)
             return 2
+
+        # 0. what you typed -> your lab's names
+        start, end, notes = args.start, args.end, []
+        if not args.exact:
+            ask_user = sys.stdin.isatty() and not args.yes and not args.json
+            missing = []
+            for role, typed, desc in (("start", args.start, args.start_desc), ("end", args.end, args.end_desc)):
+                name, note = resolve_lab_noun(session, typed, desc, role, ask_user)
+                if name is None:
+                    missing.append(typed)
+                    continue
+                if note:
+                    notes.append(note)
+                if role == "start":
+                    start = name
+                else:
+                    end = name
+            if missing:
+                nouns = [r["n"] for r in session.run("MATCH (n:Noun) RETURN n.name AS n ORDER BY n")]
+                print("\nNothing in your lab matches " + " or ".join(f"'{m}'" for m in missing) + ".\n"
+                      "  Your lab's nouns are: " + ", ".join(nouns) + "\n"
+                      "  What you can do:\n"
+                      "    - use one of those names (or a close wording of it)\n"
+                      "    - if your lab really works with it, add it to seed.cypher (which equipment accepts or "
+                      "produces it) and reload\n")
+                return 1
+
         n_read = session.run("MATCH (p:Paper) WHERE p.extracted RETURN count(p) AS n").single()["n"]
         check_lit = not args.no_literature_check and n_read > 0
         if n_read == 0:
@@ -331,16 +471,17 @@ def main() -> int:
 
         # 1. candidates, tagged with where they came from
         candidates: list[tuple[str, Candidate]] = []
+        info = None
         if n_read:
-            for c in graph_candidates(session, args.start, args.start_desc, args.end, args.end_desc,
-                                      lab, args.per_pair, args.max_steps):
-                candidates.append(("literature", c))
-        n_papers = 0
+            found, info = graph_candidates(session, start, f"{args.start} {args.start_desc}",
+                                           end, f"{args.end} {args.end_desc}",
+                                           lab, args.per_pair, args.max_steps)
+            candidates += [("literature", c) for c in found]
         if args.llm != "none":
             k = args.papers or (30 if args.llm == "claude" else 12)
             try:
-                found, n_papers = llm_candidates(session, args.llm, args.start, args.start_desc, args.end,
-                                                 args.end_desc, lab, args.num, k)
+                found, _ = llm_candidates(session, args.llm, start, args.start_desc, end,
+                                          args.end_desc, lab, args.num, k)
                 tag = "claude" if args.llm == "claude" else "local AI"
                 candidates += [(tag, c) for c in found]
             except EngineError as e:
@@ -350,7 +491,7 @@ def main() -> int:
                 candidates += [("file", Candidate(**c)) for c in json.load(fh)]
 
         # 2. check each; valid first, then shorter, then better supported
-        results = [(src, c, validate(session, args.start, args.end, c, check_lit)) for src, c in candidates]
+        results = [(src, c, validate(session, start, end, c, check_lit)) for src, c in candidates]
         results.sort(key=lambda r: (bool(r[2]), len(r[1].steps),
                                     -len({x for s in r[1].steps for x in s.citations})))
         valid = [(src, c) for src, c, p in results if not p]
@@ -358,12 +499,12 @@ def main() -> int:
         if valid and not args.no_save:
             routes = []
             for src, c in valid:
-                inputs = [args.start] + [s.output for s in c.steps[:-1]]
-                routes.append({"summary": summary(args.start, c), "rationale": c.rationale, "basis": c.basis,
+                inputs = [start] + [s.output for s in c.steps[:-1]]
+                routes.append({"summary": summary(start, c), "rationale": c.rationale, "basis": c.basis,
                                "source": src,
                                "steps": [{**s.model_dump(), "input": i} for s, i in zip(c.steps, inputs)]})
-            session.run(SAVE_QUERY, start=args.start, start_desc=args.start_desc, end=args.end,
-                        end_desc=args.end_desc, routes=routes).consume()
+            session.run(SAVE_QUERY, start=start, start_typed=args.start, start_desc=args.start_desc,
+                        end=end, end_typed=args.end, end_desc=args.end_desc, routes=routes).consume()
 
         cited = sorted({x for _, c, _ in results for s in c.steps for x in s.citations})
         titles = {r["id"]: f"{r['t']} ({r['y']})" for r in session.run(
@@ -371,24 +512,30 @@ def main() -> int:
 
     if args.json:
         print(json.dumps({
-            "start": args.start, "start_desc": args.start_desc, "end": args.end, "end_desc": args.end_desc,
+            "start": start, "start_typed": args.start, "start_desc": args.start_desc,
+            "end": end, "end_typed": args.end, "end_desc": args.end_desc, "notes": notes,
             "candidates": [{**c.model_dump(), "source": src, "valid": not p, "problems": p}
                            for src, c, p in results],
         }, indent=2))
         return 0 if valid else 1
 
     # --- comparison of all candidates ---
-    print(f"\n{args.start}  ->  {args.end}")
+    print(f"\n{start}  ->  {end}")
+    for note in notes:
+        print(f"  ({note})")
     if args.start_desc or args.end_desc:
         print(f"  start: {args.start_desc or '-'}\n  end:   {args.end_desc or '-'}")
     by_src = {}
     for src, _, _ in results:
         by_src[src] = by_src.get(src, 0) + 1
-    print(f"{len(results)} candidates (" + ", ".join(f"{n} from {s}" for s, n in by_src.items())
-          + f"), {len(valid)} valid in this lab\n")
+    print(f"{len(results)} candidates" + (" (" + ", ".join(f"{n} from {s}" for s, n in by_src.items()) + ")"
+                                          if by_src else "") + f", {len(valid)} valid in this lab\n")
     if not results:
-        print("  No candidates found. Check that map_names.py has matched your start and end,\n"
-              "  or try --llm local for AI suggestions.\n")
+        if info is not None:
+            print("  No candidates found. " + explain_empty(args.start, args.end, info, args.max_steps) + "\n")
+        else:
+            print("  No candidates found: the literature library is empty. Build it first "
+                  "(harvest_literature.py, then extract_knowledge.py).\n")
         return 1
     print(f"  {'#':>2}  {'result':<8} {'source':<10} {'steps':>5} {'papers':>6}  route")
     for i, (src, c, p) in enumerate(results, 1):
@@ -402,7 +549,7 @@ def main() -> int:
     print()
 
     def show(c: Candidate, marker: str, src: str, problems: list[str]) -> None:
-        print(f"  {marker} {args.start}   (from {src})")
+        print(f"  {marker} {start}   (from {src})")
         for i, s in enumerate(c.steps, 1):
             print(f"        {i}. [{s.equipment}] {s.process}  ->  {s.output}")
             for pid in s.citations[:3]:

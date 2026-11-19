@@ -172,7 +172,7 @@ def main() -> int:
 
         total = session.run("MATCH (p:Paper) RETURN count(p) AS n").single()["n"]
     print(f"\nAdded {added} papers. The library now holds {total}.")
-    print("Next: python extract_knowledge.py   (Claude reads them and builds the literature graph)")
+    print("Next: python extract_knowledge.py   (an AI on your computer reads them and builds the literature graph)")
     return 0
 
 
