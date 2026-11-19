@@ -1,20 +1,19 @@
 # Lab Route Planner
 
-Give a **start** and **end** material. You get back the process sequences your lab can actually run.
+Give a **start** and an **end**. Claude, as the expert, proposes process sequences from its own
+knowledge. Each one is compared with what your lab has, and Neo4j presents the ones you can run.
 
 ```
-start, end ──► Claude (expert) proposes N sequences
+start, end ──► Claude (expert) proposes sequences from its own knowledge:
+               each step = process + equipment it needs + consumables it uses
                       │
                       ▼
-               Neo4j checks each one against the lab:
-                 • every step is a process the lab has
-                 • step outputs chain into the next step's inputs
-                 • start → … → end
-                 • all equipment is available
-                 • total consumables needed ≤ stock
+               compare with the lab inventory in Neo4j:
+                 • the lab has every piece of equipment, and it's available
+                 • the lab has every consumable, with enough stock for the whole route
                       │
                       ▼
-               valid sequences (printed + saved in Neo4j)
+               valid sequences: printed, and saved in Neo4j to view as a graph
 ```
 
 ## Setup
@@ -25,73 +24,77 @@ pip install -r requirements.txt
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-export NEO4J_URI=bolt://localhost:7687 NEO4J_USER=neo4j NEO4J_PASSWORD=labpassword
+export NEO4J_URI=bolt://localhost:7688 NEO4J_USER=neo4j NEO4J_PASSWORD=labpassword
 ```
 
-Load the example lab, or your own data using the same model (see the top of `seed.cypher`):
+Load your lab inventory. `seed.cypher` is an example; edit it to match your lab. It only adds or
+updates items and never deletes anything, so you can re-run it after every edit.
 
 ```bash
-cypher-shell -u neo4j -p labpassword -f seed.cypher
+docker exec -i neo4j-lab cypher-shell -u neo4j -p labpassword < seed.cypher
 ```
-
-### Example 2: print powder → tensile test specimen (metal 3D printing)
-
-`seed_am_lab.cypher` adds a metal additive-manufacturing lab. It only adds data and does not delete anything:
-
-```bash
-docker exec -i neo4j-lab cypher-shell -u neo4j -p labpassword < seed_am_lab.cypher
-```
-
-```bash
-python route_planner.py "print powder" "tensile test specimen" --candidates example_am_candidates.json --show-rejected
-```
-
-Use `"tensile test results"` as the end material to include the tensile test itself as the last step.
 
 ## Run
 
 ```bash
-python route_planner.py "Alumina powder" "Coated disc"
+python route_planner.py "print powder" "tensile test specimen"
 ```
-
-Options:
 
 | flag | what it does |
 |---|---|
 | `-n 8` | ask for up to 8 sequences (default 5) |
-| `--show-rejected` | also show rejected sequences and why |
-| `--candidates file.json` | check your own sequences instead of asking the LLM |
+| `--show-rejected` | also show rejected sequences and what the lab is missing |
+| `--details` | show each step's equipment and consumables |
+| `--candidates file.json` | check sequences from a file instead of asking Claude (no API key needed) |
 | `--json` | machine-readable output |
-| `--no-save` | don't write the valid routes to Neo4j |
+| `--no-save` | don't save the valid routes in Neo4j |
 
-## Graph model
+Test without an API key:
 
-```
-(:Process {name, description})
-  -[:INPUT]->(:Material {name})
-  -[:OUTPUT]->(:Material)
-  -[:NEEDS_EQUIPMENT]->(:Equipment {name, available: bool})
-  -[:NEEDS_CONSUMABLE {qty}]->(:Consumable {name, stock, unit})
+```bash
+python route_planner.py "print powder" "tensile test specimen" --candidates example_candidates.json --show-rejected
 ```
 
-To match what's in the lab right now, update `available` and `stock`, e.g.:
+## Lab inventory in Neo4j
+
+Only two kinds of node:
+
+```
+(:Equipment  {name, available})    available = can be used right now (true/false)
+(:Consumable {name, stock, unit})  stock     = how much is on hand
+```
+
+Update it as the lab changes, in `seed.cypher` or directly in the Neo4j Browser:
 
 ```cypher
-MATCH (e:Equipment {name:'Cold isostatic press'}) SET e.available = true;
-MATCH (c:Consumable {name:'Plaster moulds'}) SET c.stock = 10;
+MATCH (e:Equipment {name:'HIP unit'}) SET e.available = true;
+MATCH (c:Consumable {name:'EDM brass wire'}) SET c.stock = 2;
+MERGE (e:Equipment {name:'Electropolishing station'}) SET e.available = true;
 ```
 
-Valid results are saved as:
+Claude is given the inventory names only so it can use your lab's names for the same item
+(e.g. "LPBF printer" rather than "laser powder bed fusion machine"). It still proposes routes on
+technical merit, including ones that need things the lab lacks; those are rejected and tell you
+what's missing.
 
-```
-(:RouteQuery {start, end, createdAt})-[:FOUND {rank}]->(:Route {steps, rationale})-[:STEP {order}]->(:Process)
-```
+## Viewing the valid routes in Neo4j
 
 ```cypher
-MATCH (q:RouteQuery)-[f:FOUND]->(r:Route) RETURN q.start, q.end, f.rank, r.steps ORDER BY q.createdAt DESC, f.rank;
+MATCH (q:RouteQuery)-[f:FOUND]->(r:Route)-[s:STEP]->(st:Step)-[u]->(x) RETURN q, f, r, s, st, u, x
+```
+
+Saved as:
+
+```
+(:RouteQuery {start, end, createdAt})-[:FOUND {rank}]->(:Route {summary, rationale, basis})
+  -[:STEP {order}]->(:Step {order, process})
+     -[:USES]->(:Equipment)
+     -[:CONSUMES {qty}]->(:Consumable)
 ```
 
 ## Notes
 
-- The LLM sees the lab's process catalog, so it uses your process names. It may still suggest a process the lab lacks; that route is rejected with "the lab has no such process", which tells you what the lab is missing.
-- The Claude call uses server-side refusal fallbacks (`fallbacks="default"`). If the request is declined, the API retries it on a fallback model. Remove the `betas`/`fallbacks` lines in `propose_sequences` to turn this off.
+- Use Chrome or Firefox for the Neo4j Browser; Safari blocks its unencrypted local connection.
+- The Claude call uses server-side refusal fallbacks (`fallbacks="default"`): if the request is
+  declined, the API retries on a fallback model. Remove the `betas`/`fallbacks` lines in
+  `propose_sequences` to turn this off.

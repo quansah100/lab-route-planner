@@ -1,8 +1,45 @@
 [
-  {"steps": ["Spray drying", "Uniaxial pressing", "Conventional sintering", "Lapping and polishing", "Sputter coating"], "rationale": "Classic press-and-sinter route, gold sputtered."},
-  {"steps": ["Spark plasma sintering", "Lapping and polishing", "Sputter coating"], "rationale": "SPS skips granulation and pressing."},
-  {"steps": ["Spray drying", "Cold isostatic pressing", "Conventional sintering", "Lapping and polishing", "Sputter coating"], "rationale": "CIP gives more uniform green density."},
-  {"steps": ["Slip casting", "Conventional sintering", "Lapping and polishing", "Sol-gel dip coating"], "rationale": "Slip cast then oxide coat."},
-  {"steps": ["Spray drying", "Uniaxial pressing", "Hot pressing", "Lapping and polishing", "Sputter coating"], "rationale": "Hot pressing for higher density."},
-  {"steps": ["Spray drying", "Conventional sintering", "Lapping and polishing", "Sputter coating"], "rationale": "Broken chain example."}
+  {
+    "rationale": "Standard LPBF route: qualify and sieve the powder, print bars, stress relieve, machine an E8 round specimen.",
+    "basis": "ASTM F3049 (powder characterization), ASTM F3301 (heat treatment), ASTM E8/E8M specimen geometry",
+    "steps": [
+      {"process": "Powder characterization", "equipment": ["Laser particle size analyzer", "Scanning electron microscope", "Hall flowmeter"],
+       "consumables": [{"name": "SEM stubs", "qty": 2, "unit": "pcs"}, {"name": "Carbon tape", "qty": 0.1, "unit": "rolls"}]},
+      {"process": "Powder sieving", "equipment": ["Sieve shaker"], "consumables": [{"name": "Sieve mesh 63um", "qty": 1, "unit": "pcs"}]},
+      {"process": "Laser powder bed fusion of bars", "equipment": ["LPBF printer"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
+      {"process": "Stress relief heat treatment", "equipment": ["Vacuum furnace"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
+      {"process": "Remove bars from build plate", "equipment": ["Band saw"], "consumables": []},
+      {"process": "CNC machining to ASTM E8 round specimen", "equipment": ["CNC lathe"], "consumables": [{"name": "Cutting inserts", "qty": 2, "unit": "pcs"}]}
+    ]
+  },
+  {
+    "rationale": "Adds HIP after stress relief to close porosity, giving more representative ductility.",
+    "basis": "ASTM F3001 / F3302 (HIP of AM parts), ASTM E8/E8M",
+    "steps": [
+      {"process": "Powder characterization", "equipment": ["Laser particle size analyzer", "Scanning electron microscope", "Hall flowmeter"], "consumables": []},
+      {"process": "Laser powder bed fusion of bars", "equipment": ["LPBF printer"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
+      {"process": "Stress relief heat treatment", "equipment": ["Vacuum furnace"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
+      {"process": "Hot isostatic pressing", "equipment": ["HIP unit"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
+      {"process": "CNC machining to ASTM E8 round specimen", "equipment": ["CNC lathe"], "consumables": [{"name": "Cutting inserts", "qty": 2, "unit": "pcs"}]}
+    ]
+  },
+  {
+    "rationale": "Print near-net flat specimens and cut the profile by wire EDM, avoiding turning.",
+    "basis": "ASTM E8/E8M flat specimen, common AM test-coupon practice",
+    "steps": [
+      {"process": "Powder characterization", "equipment": ["Laser particle size analyzer", "Hall flowmeter"], "consumables": []},
+      {"process": "Laser powder bed fusion of plates", "equipment": ["LPBF printer"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
+      {"process": "Wire EDM of flat tensile specimens", "equipment": ["Wire EDM"], "consumables": [{"name": "EDM brass wire", "qty": 1, "unit": "spools"}]}
+    ]
+  },
+  {
+    "rationale": "Machined surfaces are electropolished to remove machining marks before testing.",
+    "basis": "Surface-finish studies on AM tensile specimens",
+    "steps": [
+      {"process": "Powder characterization", "equipment": ["Laser particle size analyzer"], "consumables": []},
+      {"process": "Laser powder bed fusion of bars", "equipment": ["LPBF printer"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
+      {"process": "CNC machining to ASTM E8 round specimen", "equipment": ["CNC lathe"], "consumables": [{"name": "Cutting inserts", "qty": 2, "unit": "pcs"}]},
+      {"process": "Electropolishing", "equipment": ["Electropolishing station"], "consumables": [{"name": "Electropolishing electrolyte", "qty": 1, "unit": "L"}]}
+    ]
+  }
 ]
