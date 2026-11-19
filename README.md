@@ -91,6 +91,29 @@ Re-run it when you add equipment or papers. `python map_names.py --list` shows t
 python route_planner.py "print powder" "tensile test specimen" --start-desc "gas-atomized Ti-6Al-4V powder" --end-desc "ASTM E8 round specimen" --show-rejected
 ```
 
+### You always get a workflow
+
+The planner never ends with nothing. Besides the literature chains (and AI suggestions), it
+searches **your lab itself**: equipment accepts X and produces Y, so Neo4j can follow your
+equipment from start to end. It also **repairs** broken literature routes by bridging the broken
+step with lab equipment. Every workflow gets a status:
+
+| status | meaning |
+|---|---|
+| **VALID** | your lab can run it, and every step is reported by a paper in the library |
+| **LAB-READY** | your lab can run it, but some steps aren't backed by a paper (listed, check them yourself) |
+| **BLOCKED** | needs a fix first; the exact fixes are listed (e.g. "LPBF printer: not available") |
+
+The best one is shown first as **RECOMMENDED WORKFLOW**: valid before lab-ready before blocked,
+then the fewest fixes, the most supporting papers, and the fewest steps. If nothing is runnable
+today, the recommended one is the blocked workflow with the smallest fix list, and the tool also
+shows how far your lab gets from the start and which steps papers use to cover the missing part
+(equipment to get, borrow or outsource).
+
+For automation, `--json` always returns a `recommended` workflow with its `status`,
+`lab_problems` and `literature_problems`, or an `error` field (e.g. `no_lab_match`) saying why
+there is none. Runnable workflows (valid and lab-ready) are saved in Neo4j with their status.
+
 ### You don't have to type your lab's exact names
 
 The tool works out which of your lab's names you mean by its **role in the process**, not by
@@ -123,11 +146,13 @@ tells you.
 | `--match claude` | the same with Claude (paid, more accurate) |
 | `--match words` | match by shared words only (fast, no AI) |
 | `--exact` | use start/end exactly as typed (no translation into lab names) |
+| `--lab-routes 10` | how many routes to take from the lab itself (default 5) |
+| `--no-fallback` | literature/AI routes only: no lab routes, repairs or gap analysis |
 | `--yes` | never ask; take the best lab name automatically |
 | `--llm local` | also ask the free local model for suggestions (slower) |
 | `--llm claude` | also ask Claude for suggestions (paid; needs `ANTHROPIC_API_KEY`) |
-| `--show-rejected` | print rejected sequences in full, with the reasons |
-| `--valid-only` | list only valid candidates in the comparison |
+| `--show-rejected` | print every workflow in full, blocked ones included |
+| `--valid-only` | list only runnable workflows in the comparison |
 | `--max-steps 12` | allow longer literature chains (default 10) |
 | `--candidates file.json` | also check sequences from a file |
 | `--no-literature-check` | don't require every step to cite a paper |

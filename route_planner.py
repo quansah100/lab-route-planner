@@ -23,30 +23,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 
 from pydantic import BaseModel, Field
 
 from common import database, get_driver, lucene_query, setup_schema
 from llm import EngineError, ask, check_local
 from matching import resolve_endpoints
-
-
-class Step(BaseModel):
-    process: str = Field(description="Short description of what this step does")
-    equipment: str = Field(description="The single piece of equipment that performs this step")
-    output: str = Field(description="The noun this step produces, which the next step takes in")
-    citations: list[str] = Field(default_factory=list,
-                                 description="Ids of the papers (e.g. W2741809807) that support this step")
-
-
-class Candidate(BaseModel):
-    steps: list[Step] = Field(description="Ordered steps; the first takes START, the last produces END")
-    rationale: str = Field(description="One or two sentences on why this route makes sense")
-    basis: str = Field(description="Standards and literature this route is based on")
-
-
-class Proposal(BaseModel):
-    candidates: list[Candidate]
+from fallback import capability_gap, lab_routes, repair
+from models import Candidate, Proposal, Step, route_key
 
 
 # --------------------------------------------------------------------------
@@ -260,7 +245,8 @@ WITH q
 UNWIND range(0, size($routes) - 1) AS r
 WITH q, r, $routes[r] AS route
 CREATE (q)-[:FOUND {rank: r + 1}]->(rt:Route {summary: route.summary, rationale: route.rationale,
-                                              basis: route.basis, source: route.source})
+                                              basis: route.basis, source: route.source,
+                                              status: route.status})
 WITH rt, route
 UNWIND range(0, size(route.steps) - 1) AS s
 WITH rt, s, route.steps[s] AS step
@@ -280,18 +266,24 @@ CALL (st, step) {
 """
 
 
-def validate(session, start: str, end: str, cand: Candidate, check_literature: bool) -> list[str]:
-    """Check one route. An empty list means the route is valid."""
+def validate(session, start: str, end: str, cand: Candidate,
+             check_literature: bool) -> tuple[list[str], list[str]]:
+    """Check one route. Returns (lab problems, literature problems).
+
+    Lab problems mean the lab can't run it as is. Literature problems mean some
+    steps aren't backed by a paper in the library; the lab could still run it.
+    """
     if not cand.steps:
-        return ["empty sequence"]
-    problems: list[str] = []
+        return ["empty sequence"], []
+    lab_p: list[str] = []
+    lit_p: list[str] = []
 
     if check_literature:
         cited = sorted({c for s in cand.steps for c in s.citations})
         known = set(session.run(KNOWN_PAPERS, ids=cited).single()["ids"]) if cited else set()
         for i, s in enumerate(cand.steps, 1):
             if not any(c in known for c in s.citations):
-                problems.append(f"step {i} ({s.equipment}): no supporting paper in the library")
+                lit_p.append(f"step {i} ({s.equipment}): no paper in the library reports this step")
             s.citations = [c for c in s.citations if c in known]  # never store made-up ids
 
     facts = [r.data() for r in session.run(STEP_QUERY, equipment=[s.equipment for s in cand.steps])]
@@ -299,21 +291,30 @@ def validate(session, start: str, end: str, cand: Candidate, check_literature: b
     for step, f in zip(cand.steps, facts):
         label = f"step {f['idx'] + 1} ({step.equipment})"
         if not f["found"]:
-            problems.append(f"{label}: the lab doesn't have this equipment")
+            lab_p.append(f"{label}: the lab doesn't have this equipment")
         else:
             if f["available"] is not True:
-                problems.append(f"{label}: not available")
+                lab_p.append(f"{label}: not available")
             if f["accessible"] is not True:
-                problems.append(f"{label}: not accessible")
+                lab_p.append(f"{label}: not accessible")
             if incoming.lower() not in f["accepts"]:
-                problems.append(f"{label}: does not accept '{incoming}'")
+                lab_p.append(f"{label}: does not accept '{incoming}'")
             if step.output.lower() not in f["produces"]:
-                problems.append(f"{label}: does not produce '{step.output}'")
+                lab_p.append(f"{label}: does not produce '{step.output}'")
         incoming = step.output
 
     if cand.steps[-1].output.lower() != end.lower():
-        problems.append(f"route ends with '{cand.steps[-1].output}', not '{end}'")
-    return problems
+        lab_p.append(f"route ends with '{cand.steps[-1].output}', not '{end}'")
+    return lab_p, lit_p
+
+
+def status_of(lab_p: list[str], lit_p: list[str]) -> str:
+    if lab_p:
+        return "BLOCKED"
+    return "LAB-READY" if lit_p else "VALID"
+
+
+STATUS_ORDER = {"VALID": 0, "LAB-READY": 1, "BLOCKED": 2}
 
 
 def summary(start: str, cand: Candidate) -> str:
@@ -343,7 +344,10 @@ def main() -> int:
                     help="how to translate start/end into lab names: local = free AI, checks every word "
                          "and the operational role (default); claude = paid AI; words = shared words only")
     ap.add_argument("--yes", action="store_true", help="never ask; take the best lab name automatically")
-    ap.add_argument("--valid-only", action="store_true", help="list only valid candidates in the comparison")
+    ap.add_argument("--valid-only", action="store_true", help="list only runnable candidates in the comparison")
+    ap.add_argument("--lab-routes", type=int, default=5, help="routes to take from the lab itself (default 5)")
+    ap.add_argument("--no-fallback", action="store_true",
+                    help="literature/AI routes only: no lab routes, no repairs, no gap analysis")
     ap.add_argument("--show-rejected", action="store_true", help="also print rejected sequences in full")
     ap.add_argument("--no-literature-check", action="store_true",
                     help="don't require each step to be backed by a paper")
@@ -377,9 +381,14 @@ def main() -> int:
             missing = [t for t, r in ((args.start, r_start), (args.end, r_end)) if r is None]
             start, end = r_start or args.start, r_end or args.end
             if missing:
+                nouns = [r["n"] for r in session.run("MATCH (n:Noun) RETURN n.name AS n ORDER BY n")]
+                if args.json:
+                    print(json.dumps({"start_typed": args.start, "end_typed": args.end, "notes": notes,
+                                      "error": "no_lab_match", "unmatched": missing, "lab_nouns": nouns,
+                                      "recommended": None, "candidates": []}, indent=2))
+                    return 1
                 for note in notes:
                     print(f"  ({note})")
-                nouns = [r["n"] for r in session.run("MATCH (n:Noun) RETURN n.name AS n ORDER BY n")]
                 print("\nNothing in your lab matches " + " or ".join(f"'{m}'" for m in missing) + ".\n"
                       "  Your lab's nouns are: " + ", ".join(nouns) + "\n"
                       "  What you can do:\n"
@@ -414,94 +423,158 @@ def main() -> int:
         if args.candidates:
             with open(args.candidates) as fh:
                 candidates += [("file", Candidate(**c)) for c in json.load(fh)]
+        # routes through the lab itself: there is always one if the lab can do it at all
+        if not args.no_fallback:
+            candidates += lab_routes(session, start, end, k=args.lab_routes, hops=args.max_steps + 2)
 
-        # 2. check each; valid first, then shorter, then better supported
-        results = [(src, c, validate(session, start, end, c, check_lit)) for src, c in candidates]
-        results.sort(key=lambda r: (bool(r[2]), len(r[1].steps),
-                                    -len({x for s in r[1].steps for x in s.citations})))
-        valid = [(src, c) for src, c, p in results if not p]
+        # 2. check each
+        lab_lower = {name.lower(): e for name, e in lab.items()}
 
-        if valid and not args.no_save:
+        def step_ok(incoming: str, s: Step) -> bool:
+            e = lab_lower.get(s.equipment.lower())
+            return bool(e and e["usable"] and incoming.lower() in e["accepts"]
+                        and s.output.lower() in e["produces"])
+
+        lab_nouns = {r["n"] for r in session.run("MATCH (n:Noun) RETURN n.name AS n")}
+        results, seen = [], set()
+
+        def add(src_tag: str, c: Candidate) -> None:
+            key = route_key(c)
+            if key in seen:
+                return
+            seen.add(key)
+            lab_p, lit_p = validate(session, start, end, c, check_lit)
+            results.append({"source": src_tag, "cand": c, "lab": lab_p, "lit": lit_p,
+                            "status": status_of(lab_p, lit_p)})
+
+        for src_tag, c in candidates:
+            add(src_tag, c)
+        # 3. repair the broken literature / AI routes with lab steps
+        if not args.no_fallback:
+            for r in [r for r in results if r["status"] == "BLOCKED" and not r["source"].startswith("lab")]:
+                fixed = repair(session, start, end, r["cand"], lab_nouns, step_ok)
+                if fixed:
+                    add(f"{r['source']}+fix", fixed)
+
+        def rank(r):
+            papers = len({x for s in r["cand"].steps for x in s.citations})
+            return (STATUS_ORDER[r["status"]], len(r["lab"]), len(r["lit"]), -papers, len(r["cand"].steps))
+        results.sort(key=rank)
+        runnable = [r for r in results if r["status"] != "BLOCKED"]
+        recommended = results[0] if results else None
+        gap = None
+        if not runnable and not args.no_fallback:
+            gap = capability_gap(session, start, end, hops=args.max_steps + 2)
+
+        if runnable and not args.no_save:
             routes = []
-            for src, c in valid:
+            for r in runnable:
+                c = r["cand"]
                 inputs = [start] + [s.output for s in c.steps[:-1]]
                 routes.append({"summary": summary(start, c), "rationale": c.rationale, "basis": c.basis,
-                               "source": src,
+                               "source": r["source"], "status": r["status"],
                                "steps": [{**s.model_dump(), "input": i} for s, i in zip(c.steps, inputs)]})
             session.run(SAVE_QUERY, start=start, start_typed=args.start, start_desc=args.start_desc,
                         end=end, end_typed=args.end, end_desc=args.end_desc, routes=routes).consume()
 
-        cited = sorted({x for _, c, _ in results for s in c.steps for x in s.citations})
-        titles = {r["id"]: f"{r['t']} ({r['y']})" for r in session.run(
+        cited = sorted({x for r in results for s in r["cand"].steps for x in s.citations})
+        titles = {row["id"]: f"{row['t']} ({row['y']})" for row in session.run(
             "MATCH (p:Paper) WHERE p.id IN $ids RETURN p.id AS id, p.title AS t, p.year AS y", ids=cited)}
+
+    def as_json(r):
+        return {**r["cand"].model_dump(), "source": r["source"], "status": r["status"],
+                "lab_problems": r["lab"], "literature_problems": r["lit"]}
 
     if args.json:
         print(json.dumps({
             "start": start, "start_typed": args.start, "start_desc": args.start_desc,
             "end": end, "end_typed": args.end, "end_desc": args.end_desc, "notes": notes,
-            "candidates": [{**c.model_dump(), "source": src, "valid": not p, "problems": p}
-                           for src, c, p in results],
+            "recommended": as_json(recommended) if recommended else None,
+            "capability_gap": gap,
+            "candidates": [as_json(r) for r in results],
         }, indent=2))
-        return 0 if valid else 1
+        return 0 if runnable else 1
 
-    # --- comparison of all candidates ---
+    # --- output ---
     print(f"\n{start}  ->  {end}")
     for note in notes:
         print(f"  ({note})")
     if args.start_desc or args.end_desc:
         print(f"  start: {args.start_desc or '-'}\n  end:   {args.end_desc or '-'}")
-    by_src = {}
-    for src, _, _ in results:
-        by_src[src] = by_src.get(src, 0) + 1
-    print(f"{len(results)} candidates" + (" (" + ", ".join(f"{n} from {s}" for s, n in by_src.items()) + ")"
-                                          if by_src else "") + f", {len(valid)} valid in this lab\n")
-    if not results:
-        if info is not None:
-            print("  No candidates found. " + explain_empty(args.start, args.end, info, args.max_steps) + "\n")
-        else:
-            print("  No candidates found: the literature library is empty. Build it first "
-                  "(harvest_literature.py, then extract_knowledge.py).\n")
-        return 1
-    print(f"  {'#':>2}  {'result':<8} {'source':<10} {'steps':>5} {'papers':>6}  route")
-    for i, (src, c, p) in enumerate(results, 1):
-        if args.valid_only and p:
-            continue
-        n_p = len({x for s in c.steps for x in s.citations})
-        route = " > ".join(s.equipment for s in c.steps)
-        print(f"  {i:>2}  {'VALID' if not p else 'rejected':<8} {src:<10} {len(c.steps):>5} {n_p:>6}  {route}")
-        if p:
-            print(f"{'':31}why rejected: {p[0]}" + (f" (+{len(p) - 1} more)" if len(p) > 1 else ""))
-    print()
+    counts = Counter(r["status"] for r in results)
+    print(f"{len(results)} candidates: {counts['VALID']} valid, {counts['LAB-READY']} lab-ready "
+          f"(no paper for some steps), {counts['BLOCKED']} blocked\n")
 
-    def show(c: Candidate, marker: str, src: str, problems: list[str]) -> None:
-        print(f"  {marker} {start}   (from {src})")
+    def show(r, marker: str) -> None:
+        c = r["cand"]
+        print(f"  {marker} {r['status']}   (from {r['source']})")
+        print(f"      {start}")
         for i, s in enumerate(c.steps, 1):
             print(f"        {i}. [{s.equipment}] {s.process}  ->  {s.output}")
             for pid in s.citations[:3]:
                 print(f"             {pid}: {titles.get(pid, '')}")
             if len(s.citations) > 3:
                 print(f"             ... and {len(s.citations) - 3} more papers")
-        if src != "literature":
+        if r["source"] not in ("literature", "lab", "lab (fix)"):
             print(f"      why:   {c.rationale}")
-            print(f"      basis: {c.basis}")
-        for x in problems:
-            print(f"      - {x}")
+        if r["lab"]:
+            print("      To run it, fix:")
+            for x in r["lab"]:
+                print(f"        - {x}")
+        if r["lit"]:
+            print("      Not backed by papers in the library (check these steps yourself):")
+            for x in r["lit"]:
+                print(f"        - {x}")
         print()
 
-    if valid:
-        print("Valid sequences:\n")
-        for i, (src, c) in enumerate(valid, 1):
-            show(c, f"[{i}]", src, [])
-    else:
-        print("None of the candidates can be run in this lab right now.\n")
-    if args.show_rejected:
-        for src, c, p in results:
-            if p:
-                show(c, "x", src, p)
-    if valid and not args.no_save:
-        print("Saved in Neo4j. View them, with their supporting papers, in the Neo4j Browser:")
+    if recommended:
+        print("RECOMMENDED WORKFLOW")
+        show(recommended, "*")
+    if gap is not None:
+        print("Your lab can't get from start to end with the equipment usable today.")
+        if gap["reach"]:
+            print(f"  From '{start}' your lab can make: {', '.join(gap['reach'])}")
+        else:
+            print(f"  None of your usable equipment takes '{start}'.")
+        if gap["feeds_end"]:
+            print(f"  Things your lab can turn into '{end}': {', '.join(gap['feeds_end'])}")
+        else:
+            print(f"  None of your equipment produces '{end}'.")
+        if gap["bridges"]:
+            print("  How papers cover the missing part (equipment to get, borrow or outsource):")
+            for b in gap["bridges"]:
+                to = f"{b['to']}" + (f" (= your {', '.join(b['lab_names'])})" if b["lab_names"] else "")
+                print(f"    - {b['lab_from']} -> {b['process']} [{b['equipment']}] -> {to}"
+                      f"   ({b['papers']} papers)")
+        print()
+    if not results:
+        if info is not None:
+            print("  No candidates found. " + explain_empty(args.start, args.end, info, args.max_steps) + "\n")
+        return 1
+
+    print(f"  {'#':>2}  {'status':<9} {'source':<16} {'steps':>5} {'papers':>6}  route")
+    for i, r in enumerate(results, 1):
+        if args.valid_only and r["status"] == "BLOCKED":
+            continue
+        c = r["cand"]
+        n_p = len({x for s in c.steps for x in s.citations})
+        route = " > ".join(s.equipment for s in c.steps)
+        print(f"  {i:>2}  {r['status']:<9} {r['source']:<16} {len(c.steps):>5} {n_p:>6}  {route}")
+        if r["lab"]:
+            print(f"{'':39}fix: {r['lab'][0]}" + (f" (+{len(r['lab']) - 1} more)" if len(r["lab"]) > 1 else ""))
+    print()
+    others = [r for r in results[1:] if r["status"] != "BLOCKED" or args.show_rejected]
+    limit = len(others) if args.show_rejected else 3
+    if others:
+        print("Other workflows:\n")
+        for i, r in enumerate(others[:limit], 2):
+            show(r, f"[{i}]")
+        if len(others) > limit:
+            print(f"  ... {len(others) - limit} more in the table above (--show-rejected prints all)\n")
+    if runnable and not args.no_save:
+        print("Saved in Neo4j (runnable workflows). View them in the Neo4j Browser:")
         print("  MATCH (q:RouteQuery)-[f:FOUND]->(r:Route)-[s:STEP]->(st:Step)-[u]->(x) RETURN q, f, r, s, st, u, x\n")
-    return 0 if valid else 1
+    return 0 if runnable else 1
 
 
 if __name__ == "__main__":
