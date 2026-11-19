@@ -1,45 +1,65 @@
 [
   {
-    "rationale": "Standard LPBF route: qualify and sieve the powder, print bars, stress relieve, machine an E8 round specimen.",
-    "basis": "ASTM F3049 (powder characterization), ASTM F3301 (heat treatment), ASTM E8/E8M specimen geometry",
+    "rationale": "Standard LPBF route: characterize and sieve the powder, print, stress relieve, cut a blank, turn an E8 round specimen.",
+    "basis": "ASTM F3049 (powder characterization), ASTM F3301 (heat treatment), ASTM E8/E8M",
     "steps": [
-      {"process": "Powder characterization", "equipment": ["Laser particle size analyzer", "Scanning electron microscope", "Hall flowmeter"],
-       "consumables": [{"name": "SEM stubs", "qty": 2, "unit": "pcs"}, {"name": "Carbon tape", "qty": 0.1, "unit": "rolls"}]},
-      {"process": "Powder sieving", "equipment": ["Sieve shaker"], "consumables": [{"name": "Sieve mesh 63um", "qty": 1, "unit": "pcs"}]},
-      {"process": "Laser powder bed fusion of bars", "equipment": ["LPBF printer"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
-      {"process": "Stress relief heat treatment", "equipment": ["Vacuum furnace"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
-      {"process": "Remove bars from build plate", "equipment": ["Band saw"], "consumables": []},
-      {"process": "CNC machining to ASTM E8 round specimen", "equipment": ["CNC lathe"], "consumables": [{"name": "Cutting inserts", "qty": 2, "unit": "pcs"}]}
+      {"process": "Particle size distribution",   "equipment": "Laser particle size analyzer", "output": "Characterized powder"},
+      {"process": "Sieve to remove oversize",     "equipment": "Sieve shaker",                 "output": "Sieved powder"},
+      {"process": "Print bars",                   "equipment": "LPBF printer",                 "output": "As-built part"},
+      {"process": "Stress relief",                "equipment": "Vacuum furnace",               "output": "Stress-relieved part"},
+      {"process": "Cut bars off the build plate", "equipment": "Band saw",                     "output": "Specimen blank"},
+      {"process": "Turn to E8 round specimen",    "equipment": "CNC lathe",                    "output": "Tensile test specimen"}
     ]
   },
   {
-    "rationale": "Adds HIP after stress relief to close porosity, giving more representative ductility.",
+    "rationale": "Cut flat E8 specimens directly from stress-relieved plates by wire EDM.",
+    "basis": "ASTM E8/E8M flat specimen, common AM coupon practice",
+    "steps": [
+      {"process": "Particle size distribution", "equipment": "Laser particle size analyzer", "output": "Characterized powder"},
+      {"process": "Sieve to remove oversize",   "equipment": "Sieve shaker",                 "output": "Sieved powder"},
+      {"process": "Print plates",               "equipment": "LPBF printer",                 "output": "As-built part"},
+      {"process": "Stress relief",              "equipment": "Vacuum furnace",               "output": "Stress-relieved part"},
+      {"process": "Wire EDM flat specimens",    "equipment": "Wire EDM",                     "output": "Tensile test specimen"}
+    ]
+  },
+  {
+    "rationale": "Adds HIP to close porosity before machining.",
     "basis": "ASTM F3001 / F3302 (HIP of AM parts), ASTM E8/E8M",
     "steps": [
-      {"process": "Powder characterization", "equipment": ["Laser particle size analyzer", "Scanning electron microscope", "Hall flowmeter"], "consumables": []},
-      {"process": "Laser powder bed fusion of bars", "equipment": ["LPBF printer"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
-      {"process": "Stress relief heat treatment", "equipment": ["Vacuum furnace"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
-      {"process": "Hot isostatic pressing", "equipment": ["HIP unit"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
-      {"process": "CNC machining to ASTM E8 round specimen", "equipment": ["CNC lathe"], "consumables": [{"name": "Cutting inserts", "qty": 2, "unit": "pcs"}]}
+      {"process": "Particle size distribution", "equipment": "Laser particle size analyzer", "output": "Characterized powder"},
+      {"process": "Print bars",                 "equipment": "LPBF printer",                 "output": "As-built part"},
+      {"process": "Stress relief",              "equipment": "Vacuum furnace",               "output": "Stress-relieved part"},
+      {"process": "Hot isostatic pressing",     "equipment": "HIP unit",                     "output": "HIPed part"},
+      {"process": "Cut blanks",                 "equipment": "Band saw",                     "output": "Specimen blank"},
+      {"process": "Turn to E8 round specimen",  "equipment": "CNC lathe",                    "output": "Tensile test specimen"}
     ]
   },
   {
-    "rationale": "Print near-net flat specimens and cut the profile by wire EDM, avoiding turning.",
-    "basis": "ASTM E8/E8M flat specimen, common AM test-coupon practice",
+    "rationale": "Check particle morphology by SEM before printing.",
+    "basis": "ASTM F3049",
     "steps": [
-      {"process": "Powder characterization", "equipment": ["Laser particle size analyzer", "Hall flowmeter"], "consumables": []},
-      {"process": "Laser powder bed fusion of plates", "equipment": ["LPBF printer"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
-      {"process": "Wire EDM of flat tensile specimens", "equipment": ["Wire EDM"], "consumables": [{"name": "EDM brass wire", "qty": 1, "unit": "spools"}]}
+      {"process": "Particle morphology",       "equipment": "Scanning electron microscope", "output": "Characterized powder"},
+      {"process": "Print plates",              "equipment": "LPBF printer",                 "output": "As-built part"},
+      {"process": "Wire EDM flat specimens",   "equipment": "Wire EDM",                     "output": "Tensile test specimen"}
     ]
   },
   {
-    "rationale": "Machined surfaces are electropolished to remove machining marks before testing.",
+    "rationale": "Machine specimens straight from the as-built bars.",
+    "basis": "ASTM E8/E8M",
+    "steps": [
+      {"process": "Particle size distribution", "equipment": "Laser particle size analyzer", "output": "Characterized powder"},
+      {"process": "Print bars",                 "equipment": "LPBF printer",                 "output": "As-built part"},
+      {"process": "Turn to E8 round specimen",  "equipment": "CNC lathe",                    "output": "Tensile test specimen"}
+    ]
+  },
+  {
+    "rationale": "Electropolish machined specimens to remove machining marks.",
     "basis": "Surface-finish studies on AM tensile specimens",
     "steps": [
-      {"process": "Powder characterization", "equipment": ["Laser particle size analyzer"], "consumables": []},
-      {"process": "Laser powder bed fusion of bars", "equipment": ["LPBF printer"], "consumables": [{"name": "Argon gas", "qty": 1, "unit": "cylinders"}]},
-      {"process": "CNC machining to ASTM E8 round specimen", "equipment": ["CNC lathe"], "consumables": [{"name": "Cutting inserts", "qty": 2, "unit": "pcs"}]},
-      {"process": "Electropolishing", "equipment": ["Electropolishing station"], "consumables": [{"name": "Electropolishing electrolyte", "qty": 1, "unit": "L"}]}
+      {"process": "Particle size distribution", "equipment": "Laser particle size analyzer", "output": "Characterized powder"},
+      {"process": "Print plates",               "equipment": "LPBF printer",                 "output": "As-built part"},
+      {"process": "Wire EDM flat specimens",    "equipment": "Wire EDM",                     "output": "Tensile test specimen"},
+      {"process": "Electropolish",              "equipment": "Electropolishing station",     "output": "Tensile test specimen"}
     ]
   }
 ]
