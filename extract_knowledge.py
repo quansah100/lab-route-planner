@@ -1,16 +1,15 @@
-"""Step 2: Claude reads every stored paper once and records the process steps it
-reports (input -> process / equipment -> output). These become the literature
-graph in Neo4j, each step linked to the paper that reports it:
+"""Step 2: an AI model reads every stored paper once and records the process
+steps it reports (input -> process / equipment -> output). These become the
+literature graph in Neo4j, each step linked to the paper that reports it:
 
     (:LitNoun)-[:INPUT_OF]->(:Transition)-[:OUTPUTS]->(:LitNoun)
     (:Transition)-[:USES]->(:LitEquipment)
     (:Paper)-[:REPORTS]->(:Transition)
 
-    python extract_knowledge.py
+    python extract_knowledge.py                  # free: local model via Ollama
+    python extract_knowledge.py --engine claude  # optional, paid: Claude API
 
-Papers already read are skipped, so you can stop and re-run at any time.
-This calls the Claude API once per paper and costs money; it shows an
-estimate and asks before starting (skip the question with --yes).
+Papers already read are skipped, so you can stop (Ctrl+C) and re-run any time.
 """
 
 from __future__ import annotations
@@ -18,15 +17,16 @@ from __future__ import annotations
 import argparse
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import anthropic
 from pydantic import BaseModel, Field
 
-from common import MODEL, database, get_driver, setup_schema
+from common import database, get_driver, setup_schema
+from llm import CLAUDE_MODEL, OLLAMA_MODEL, EngineError, ask, check_local
 
-# Rough per-paper cost for the estimate (input + output incl. reasoning), in USD.
-EST_COST_PER_PAPER = 0.02
+# Rough per-paper cost when using Claude, for the estimate shown before starting (USD).
+EST_CLAUDE_COST_PER_PAPER = 0.02
 
 
 class Transition(BaseModel):
@@ -57,14 +57,18 @@ in the noun names. For characterization or testing steps, the output is the resu
 (e.g. 'particle size distribution', 'tensile test results').
 
 Do not invent steps the abstract does not support. Return an empty list if the paper \
-reports no such steps (e.g. a pure review or simulation)."""
+reports no such steps (e.g. a pure review or simulation).
+
+Answer only with JSON of the form {"transitions": [{"input": "...", "process": "...", \
+"equipment": "...", "output": "...", "material": "...", "conditions": "..."}]}."""
 
 WRITE = """
 MATCH (p:Paper {id: $id})
 OPTIONAL MATCH (p)-[:REPORTS]->(old:Transition)
 DETACH DELETE old
 WITH DISTINCT p
-SET p.extracted = true, p.extractedAt = datetime(), p.transitionCount = size($transitions)
+SET p.extracted = true, p.extractedAt = datetime(), p.extractedBy = $by,
+    p.transitionCount = size($transitions)
 WITH p
 UNWIND range(0, size($transitions) - 1) AS k
 WITH p, k, $transitions[k] AS t
@@ -78,29 +82,35 @@ CREATE (p)-[:REPORTS]->(tr), (i)-[:INPUT_OF]->(tr), (tr)-[:OUTPUTS]->(o), (tr)-[
 """
 
 
-def extract(client: anthropic.Anthropic, paper: dict) -> list[Transition]:
-    response = client.beta.messages.parse(
-        model=MODEL,
-        max_tokens=8000,
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",  # if the request is declined, the API retries on a fallback model
-        output_config={"effort": "low"},
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Title: {paper['title']}\n\nAbstract: {paper['abstract']}"}],
-        output_format=Extraction,
-    )
-    if response.stop_reason == "refusal" or response.parsed_output is None:
-        return []
-    return response.parsed_output.transitions
+def clean(transitions: list[Transition]) -> list[dict]:
+    """Drop steps with empty names (small local models sometimes produce them)."""
+    out = []
+    for t in transitions:
+        if t.input.strip() and t.output.strip() and t.process.strip():
+            d = t.model_dump()
+            d["equipment"] = d["equipment"].strip() or "unspecified"
+            out.append(d)
+    return out
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--engine", choices=["local", "claude"], default="local",
+                    help="local = free model via Ollama (default); claude = Claude API (paid)")
     ap.add_argument("--limit", type=int, help="read at most this many papers this run")
-    ap.add_argument("--workers", type=int, default=6, help="papers read in parallel (default 6)")
+    ap.add_argument("--workers", type=int, help="papers read in parallel (default: 1 local, 6 claude)")
     ap.add_argument("--redo", action="store_true", help="re-read papers that were already read")
-    ap.add_argument("--yes", action="store_true", help="don't ask for confirmation")
+    ap.add_argument("--yes", action="store_true", help="don't ask for confirmation (claude engine)")
     args = ap.parse_args()
+    workers = args.workers or (1 if args.engine == "local" else 6)
+    model = OLLAMA_MODEL if args.engine == "local" else CLAUDE_MODEL
+
+    if args.engine == "local":
+        try:
+            check_local()
+        except EngineError as e:
+            print(e, file=sys.stderr)
+            return 2
 
     driver = get_driver()
     with driver:
@@ -115,34 +125,48 @@ def main() -> int:
             print("Nothing to read: every stored paper has been read already (use --redo to re-read).")
             return 0
 
-        est = len(papers) * EST_COST_PER_PAPER
-        print(f"{len(papers)} papers to read with {MODEL}. Rough cost: ${est:.0f}-{est * 2:.0f}.")
-        if not args.yes and input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
-            print("Stopped.")
-            return 1
+        if args.engine == "claude":
+            est = len(papers) * EST_CLAUDE_COST_PER_PAPER
+            print(f"{len(papers)} papers to read with {model} (paid). Rough cost: ${est:.0f}-{est * 2:.0f}.")
+            if not args.yes and input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("Stopped.")
+                return 1
+        else:
+            print(f"{len(papers)} papers to read with {model} on this computer (free). "
+                  f"Stop any time with Ctrl+C; re-running continues where it left off.")
 
-        client = anthropic.Anthropic(max_retries=6)
         lock = threading.Lock()
         done = steps = failed = 0
+        t0 = time.time()
 
         def work(paper: dict) -> int:
-            transitions = extract(client, paper)
+            result = ask(args.engine, SYSTEM_PROMPT,
+                         f"Title: {paper['title']}\n\nAbstract: {paper['abstract']}", Extraction, effort="low")
+            rows = clean(result.transitions)
             with driver.session(database=database()) as s:
-                s.run(WRITE, id=paper["id"], transitions=[t.model_dump() for t in transitions]).consume()
-            return len(transitions)
+                s.run(WRITE, id=paper["id"], transitions=rows, by=f"{args.engine}:{model}").consume()
+            return len(rows)
 
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(work, p): p for p in papers}
-            for fut in as_completed(futures):
-                with lock:
-                    try:
-                        steps += fut.result()
-                    except anthropic.APIError as e:
-                        failed += 1
-                        print(f"  failed {futures[fut]['id']}: {e}", file=sys.stderr)
-                    done += 1
-                    if done % 25 == 0 or done == len(papers):
-                        print(f"  {done}/{len(papers)} papers read, {steps} steps recorded")
+            try:
+                for fut in as_completed(futures):
+                    with lock:
+                        try:
+                            steps += fut.result()
+                        except Exception as e:  # one bad paper shouldn't stop the run
+                            failed += 1
+                            print(f"  skipped {futures[fut]['id']}: {e}", file=sys.stderr)
+                        done += 1
+                        if done % 10 == 0 or done == len(papers):
+                            rate = (time.time() - t0) / done
+                            left = rate * (len(papers) - done) / 60
+                            print(f"  {done}/{len(papers)} papers read, {steps} steps recorded"
+                                  f"  (~{left:.0f} min left)")
+            except KeyboardInterrupt:
+                print("\nStopping; progress so far is saved. Re-run to continue.")
+                pool.shutdown(wait=False, cancel_futures=True)
+                return 130
 
         with driver.session(database=database()) as session:
             stats = session.run("""
@@ -153,8 +177,8 @@ def main() -> int:
     print(f"\nLibrary: {stats['papers']} papers, {stats['read']} read, "
           f"{stats['steps']} steps, {stats['nouns']} distinct nouns.")
     if failed:
-        print(f"{failed} papers failed; re-run to retry them.")
-    print('Next: python route_planner.py "start" "end" --start-desc "..." --end-desc "..."')
+        print(f"{failed} papers were skipped; re-run to retry them.")
+    print("Next: python map_names.py   (match the literature's names to your lab's names)")
     return 0
 
 

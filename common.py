@@ -16,6 +16,7 @@ SCHEMA = [
     "CREATE FULLTEXT INDEX paper_text IF NOT EXISTS FOR (p:Paper) ON EACH [p.title, p.abstract]",
     "CREATE FULLTEXT INDEX transition_text IF NOT EXISTS FOR (t:Transition) ON EACH [t.text]",
     "CREATE FULLTEXT INDEX lit_noun_name IF NOT EXISTS FOR (n:LitNoun) ON EACH [n.name]",
+    "CREATE FULLTEXT INDEX lit_equipment_name IF NOT EXISTS FOR (e:LitEquipment) ON EACH [e.name]",
 ]
 
 STOPWORDS = set("""a an and are as at be by for from in into is it of on or the to with without
@@ -26,6 +27,7 @@ def get_driver():
     return GraphDatabase.driver(
         os.getenv("NEO4J_URI", "bolt://localhost:7687"),
         auth=(os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", "labpassword")),
+        notifications_min_severity="OFF",  # hide harmless "type does not exist yet" warnings
     )
 
 

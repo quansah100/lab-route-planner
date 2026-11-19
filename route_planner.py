@@ -1,10 +1,12 @@
-"""Step 3: propose, compare and check sequences for one prompt.
+"""Step 4: find, compare and check sequences for one prompt (free by default).
 
 Give a START and an END, each with an optional description. The tool:
 
-  1. finds the relevant papers and step chains in the literature graph,
-  2. has Claude, as the expert, propose candidate sequences grounded in that
-     literature, citing the papers behind every step,
+  1. takes candidate sequences from the literature graph in Neo4j: chains of
+     steps where each step's output is the next step's input, every step
+     reported by a paper (free, no AI needed),
+     optionally adding suggestions from an AI model (--llm local / claude),
+  2. translates them into your lab's names (the matches from map_names.py),
   3. checks each candidate:
        * every step is backed by at least one paper in the library,
        * every step's equipment is available AND accessible in the lab,
@@ -13,8 +15,7 @@ Give a START and an END, each with an optional description. The tool:
   4. prints a comparison of all candidates and saves the valid ones in Neo4j.
 
     python route_planner.py "print powder" "tensile test specimen" \\
-        --start-desc "gas-atomized Ti-6Al-4V powder, 15-45 um" \\
-        --end-desc "ASTM E8 round tensile specimen"
+        --start-desc "gas-atomized Ti-6Al-4V powder" --end-desc "ASTM E8 round specimen"
 """
 
 from __future__ import annotations
@@ -23,85 +24,11 @@ import argparse
 import json
 import sys
 
-import anthropic
 from pydantic import BaseModel, Field
 
-from common import MODEL, database, get_driver, lucene_query, setup_schema
+from common import database, get_driver, lucene_query, setup_schema
+from llm import CLAUDE_MODEL, OLLAMA_MODEL, EngineError, ask, check_local
 
-
-# --------------------------------------------------------------------------
-# 1. Literature evidence from Neo4j
-# --------------------------------------------------------------------------
-
-PAPERS_QUERY = """
-CALL db.index.fulltext.queryNodes('paper_text', $q) YIELD node, score
-WITH node AS p, score ORDER BY score DESC LIMIT $k
-OPTIONAL MATCH (i:LitNoun)-[:INPUT_OF]->(t:Transition)<-[:REPORTS]-(p),
-               (t)-[:OUTPUTS]->(o:LitNoun), (t)-[:USES]->(e:LitEquipment)
-WITH p, score, t, i, o, e ORDER BY t.order
-RETURN p.id AS id, p.title AS title, p.year AS year, p.abstract AS abstract, score,
-       collect(CASE WHEN t IS NULL THEN NULL ELSE
-               {input: i.name, process: t.process, equipment: e.name, output: o.name,
-                material: t.material, conditions: t.conditions} END) AS steps
-ORDER BY score DESC
-"""
-
-NOUN_QUERY = """
-CALL db.index.fulltext.queryNodes('lit_noun_name', $q) YIELD node, score
-RETURN elementId(node) AS id, node.name AS name ORDER BY score DESC LIMIT $k
-"""
-
-# Step chains in the literature from a start-like noun to an end-like noun.
-PATHS_QUERY = """
-MATCH (a:LitNoun) WHERE elementId(a) IN $starts
-MATCH (b:LitNoun) WHERE elementId(b) IN $ends AND a <> b
-MATCH p = SHORTEST 2 (a)(()-[:INPUT_OF]->(:Transition)-[:OUTPUTS]->()){1,8}(b)
-WITH p LIMIT 12
-RETURN [n IN nodes(p) WHERE n:Transition |
-        {input: [(x)-[:INPUT_OF]->(n) | x.name][0],
-         process: n.process,
-         equipment: [(n)-[:USES]->(e) | e.name][0],
-         output: [(n)-[:OUTPUTS]->(y) | y.name][0],
-         paper: [(pp:Paper)-[:REPORTS]->(n) | pp.id][0]}] AS chain
-"""
-
-
-def gather_evidence(session, start: str, start_desc: str, end: str, end_desc: str,
-                    k_papers: int) -> dict:
-    q = lucene_query(start, start_desc, end, end_desc)
-    papers = [r.data() for r in session.run(PAPERS_QUERY, q=q, k=k_papers)] if q else []
-    starts = [r["id"] for r in session.run(NOUN_QUERY, q=lucene_query(start, start_desc), k=4)]
-    ends = [r["id"] for r in session.run(NOUN_QUERY, q=lucene_query(end, end_desc), k=4)]
-    chains = []
-    if starts and ends:
-        try:
-            chains = [r["chain"] for r in session.run(PATHS_QUERY, starts=starts, ends=ends)]
-        except Exception as e:  # e.g. Neo4j older than 5.21 (no SHORTEST)
-            print(f"note: literature chain search skipped ({type(e).__name__})", file=sys.stderr)
-    return {"papers": papers, "chains": chains}
-
-
-def evidence_text(ev: dict, n_abstracts: int = 8) -> str:
-    lines = ["PAPERS (cite them by id):"]
-    for i, p in enumerate(ev["papers"]):
-        lines.append(f"\n[{p['id']}] {p['title']} ({p['year']})")
-        if i < n_abstracts:
-            lines.append(f"  abstract: {p['abstract'][:1200]}")
-        for s in p["steps"]:
-            extra = "; ".join(x for x in (s["material"], s["conditions"]) if x)
-            lines.append(f"  step: {s['input']} -> {s['process']} [{s['equipment']}] -> {s['output']}"
-                         + (f"  ({extra})" if extra else ""))
-    if ev["chains"]:
-        lines.append("\nCHAINS FOUND IN THE LITERATURE GRAPH (each step: paper id):")
-        for c in ev["chains"]:
-            lines.append("  " + "  =>  ".join(
-                f"{s['input']} -> {s['process']} [{s['equipment']}] -> {s['output']} ({s['paper']})" for s in c))
-    return "\n".join(lines)
-
-
-# --------------------------------------------------------------------------
-# 2. The expert: propose candidate sequences grounded in the literature
-# --------------------------------------------------------------------------
 
 class Step(BaseModel):
     process: str = Field(description="Short description of what this step does")
@@ -121,69 +48,157 @@ class Proposal(BaseModel):
     candidates: list[Candidate]
 
 
-SYSTEM_PROMPT = """You are an expert in materials science, manufacturing processing and \
-characterization. Given a START and an END (each possibly with a description), propose \
-several distinct, technically sound sequences from START to END.
-
-Ground every step in the literature you are given: cite, for each step, the ids of the \
-papers that report that step or an equivalent one. Prefer steps and orderings the papers \
-actually use; the literature chains show steps that already connect. You may add your own \
-expert knowledge (standards such as ASTM/ISO) to fill gaps, but a step with no supporting \
-paper will be rejected, so cite whenever any given paper supports the step. Only cite ids \
-from the list you are given.
-
-Each step is performed by exactly one piece of equipment and produces one noun (a material, \
-part, specimen or result), which is what the next step takes in. The first step takes START; \
-the last must produce END.
-
-Propose on technical merit, not on what the lab owns: a separate check compares your routes \
-with the lab afterwards. You are given the lab's equipment and nouns only for naming: when \
-the lab has equipment that does the job, use its exact name, and when a noun matches one of \
-the lab's nouns, use that exact name. Make the routes genuinely different."""
-
-
-def propose_sequences(client: anthropic.Anthropic, start: str, start_desc: str, end: str,
-                      end_desc: str, lab: list[dict], evidence: str, n: int) -> list[Candidate]:
-    lab_text = "\n".join(
-        f"- {e['name']}: accepts {', '.join(e['accepts']) or '?'}; produces {', '.join(e['produces']) or '?'}"
-        for e in lab
-    )
-    user = (
-        f"{evidence}\n\n"
-        f"LAB EQUIPMENT AND NOUNS (for naming only):\n{lab_text}\n\n"
-        f"START: {start}" + (f" -- {start_desc}" if start_desc else "") + "\n"
-        f"END: {end}" + (f" -- {end_desc}" if end_desc else "") + "\n\n"
-        f"Propose up to {n} candidate sequences from START to END."
-    )
-    with client.beta.messages.stream(
-        model=MODEL,
-        max_tokens=32000,
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",  # if the request is declined, the API retries on a fallback model
-        output_config={"effort": "high"},
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user}],
-        output_format=Proposal,
-    ) as stream:
-        response = stream.get_final_message()
-    if response.stop_reason == "refusal":
-        raise RuntimeError("The model declined to propose routes for this request.")
-    if response.parsed_output is None:
-        raise RuntimeError(f"Could not read the model's answer (stop_reason={response.stop_reason}).")
-    return response.parsed_output.candidates
-
-
 # --------------------------------------------------------------------------
-# 3. The check: literature support + the lab
+# 1a. Candidates straight from the literature graph (free)
 # --------------------------------------------------------------------------
 
 LAB_QUERY = """
 MATCH (e:Equipment)
 OPTIONAL MATCH (e)-[:ACCEPTS]->(a:Noun)
 OPTIONAL MATCH (e)-[:PRODUCES]->(p:Noun)
-RETURN e.name AS name, collect(DISTINCT a.name) AS accepts, collect(DISTINCT p.name) AS produces
+RETURN e.name AS name, e.available = true AND e.accessible = true AS usable,
+       collect(DISTINCT a.name) AS accepts, collect(DISTINCT p.name) AS produces
 ORDER BY name
 """
+
+MAPPED_NOUNS = """
+MATCH (n:Noun)-[:SAME_AS]->(l:LitNoun) WHERE toLower(n.name) = toLower($name)
+RETURN collect(elementId(l)) AS ids
+"""
+
+NOUN_SEARCH = """
+CALL db.index.fulltext.queryNodes('lit_noun_name', $q) YIELD node, score
+RETURN elementId(node) AS id ORDER BY score DESC LIMIT $k
+"""
+
+CHAINS_QUERY = """
+MATCH (a:LitNoun) WHERE elementId(a) IN $starts
+MATCH (b:LitNoun) WHERE elementId(b) IN $ends AND a <> b
+MATCH p = SHORTEST {k} (a)(()-[:INPUT_OF]->(:Transition)-[:OUTPUTS]->()){{1,{hops}}}(b)
+RETURN [t IN nodes(p) WHERE t:Transition | {{
+          process: t.process,
+          lit_equipment: [(t)-[:USES]->(e) | e.name][0],
+          lit_output: [(t)-[:OUTPUTS]->(o) | o.name][0],
+          paper: [(pp:Paper)-[:REPORTS]->(t) | pp.id][0],
+          lab_equipment: [(t)-[:USES]->(:LitEquipment)<-[:SAME_AS]-(le:Equipment) | le.name],
+          lab_output: [(t)-[:OUTPUTS]->(:LitNoun)<-[:SAME_AS]-(ln:Noun) | ln.name]
+       }}] AS chain
+"""
+
+
+def lit_endpoints(session, name: str, desc: str) -> tuple[list[str], bool]:
+    """Literature nouns for a start/end: the ones you matched in map_names.py, else a text search."""
+    ids = session.run(MAPPED_NOUNS, name=name).single()["ids"]
+    if ids:
+        return ids, True
+    q = lucene_query(name, desc)
+    return ([r["id"] for r in session.run(NOUN_SEARCH, q=q, k=3)] if q else []), False
+
+
+def graph_candidates(session, start: str, start_desc: str, end: str, end_desc: str,
+                     lab: dict[str, dict], per_pair: int, max_steps: int) -> list[Candidate]:
+    starts, s_mapped = lit_endpoints(session, start, start_desc)
+    ends, e_mapped = lit_endpoints(session, end, end_desc)
+    if not s_mapped or not e_mapped:
+        print("note: " + " and ".join(n for n, m in ((f"'{start}'", s_mapped), (f"'{end}'", e_mapped)) if not m)
+              + " not matched to the literature yet (map_names.py); using a text search instead.",
+              file=sys.stderr)
+    if not starts or not ends:
+        return []
+    rows = session.run(CHAINS_QUERY.format(k=int(per_pair), hops=int(max_steps)), starts=starts, ends=ends)
+
+    merged: dict[tuple, Candidate] = {}
+    for row in rows:
+        incoming, steps = start, []
+        for t in row["chain"]:
+            equipment = pick_equipment(t["lab_equipment"], incoming, lab) or f"{t['lit_equipment']} (literature name)"
+            produced = lab.get(equipment, {}).get("produces", [])
+            outs = [o for o in t["lab_output"] if o.lower() in produced] or t["lab_output"]
+            output = outs[0] if outs else f"{t['lit_output']} (literature name)"
+            steps.append(Step(process=t["process"], equipment=equipment, output=output, citations=[t["paper"]]))
+            incoming = output
+        key = tuple((s.equipment.lower(), s.output.lower()) for s in steps)
+        if key in merged:  # same route found via other papers: pool the citations
+            for s, new in zip(merged[key].steps, steps):
+                s.citations = sorted(set(s.citations) | set(new.citations))
+        else:
+            merged[key] = Candidate(steps=steps, rationale="Chain of steps reported in the literature; "
+                                    "each step's output is the next step's input.", basis="")
+    for c in merged.values():
+        c.basis = "Papers: " + ", ".join(sorted({x for s in c.steps for x in s.citations}))
+    return list(merged.values())
+
+
+def pick_equipment(options: list[str], incoming: str, lab: dict[str, dict]) -> str | None:
+    """Of the lab equipment matched to a literature step, prefer one that is usable and accepts the input."""
+    if not options:
+        return None
+    def score(name: str) -> int:
+        e = lab.get(name, {})
+        return 2 * (incoming.lower() in e.get("accepts", [])) + bool(e.get("usable"))
+    return max(options, key=score)
+
+
+# --------------------------------------------------------------------------
+# 1b. Optional: suggestions from an AI model, grounded in the papers
+# --------------------------------------------------------------------------
+
+PAPERS_QUERY = """
+CALL db.index.fulltext.queryNodes('paper_text', $q) YIELD node, score
+WITH node AS p, score ORDER BY score DESC LIMIT $k
+OPTIONAL MATCH (i:LitNoun)-[:INPUT_OF]->(t:Transition)<-[:REPORTS]-(p),
+               (t)-[:OUTPUTS]->(o:LitNoun), (t)-[:USES]->(e:LitEquipment)
+WITH p, score, t, i, o, e ORDER BY t.order
+RETURN p.id AS id, p.title AS title, p.year AS year, p.abstract AS abstract, score,
+       collect(CASE WHEN t IS NULL THEN NULL ELSE
+               {input: i.name, process: t.process, equipment: e.name, output: o.name,
+                material: t.material, conditions: t.conditions} END) AS steps
+ORDER BY score DESC
+"""
+
+SYSTEM_PROMPT = """You are an expert in materials science, manufacturing processing and \
+characterization. Given a START and an END (each possibly with a description), propose \
+several distinct, technically sound sequences from START to END.
+
+Ground every step in the literature you are given: cite, for each step, the ids of the \
+papers that report that step or an equivalent one. A step with no supporting paper will be \
+rejected, so cite whenever any given paper supports the step. Only cite ids from the list.
+
+Each step is performed by exactly one piece of equipment and produces one noun (a material, \
+part, specimen or result), which is what the next step takes in. The first step takes START; \
+the last must produce END.
+
+Use the lab's exact names for equipment and nouns when they mean the same thing. Propose on \
+technical merit; a separate check compares your routes with the lab afterwards.
+
+Answer only with JSON of the form {"candidates": [{"steps": [{"process": "...", \
+"equipment": "...", "output": "...", "citations": ["W..."]}], "rationale": "...", "basis": "..."}]}."""
+
+
+def llm_candidates(session, engine: str, start: str, start_desc: str, end: str, end_desc: str,
+                   lab: dict[str, dict], n: int, k_papers: int) -> tuple[list[Candidate], int]:
+    q = lucene_query(start, start_desc, end, end_desc)
+    papers = [r.data() for r in session.run(PAPERS_QUERY, q=q, k=k_papers)] if q else []
+    n_abstracts = 8 if engine == "claude" else 3
+    lines = ["PAPERS (cite them by id):"]
+    for i, p in enumerate(papers):
+        lines.append(f"\n[{p['id']}] {p['title']} ({p['year']})")
+        if i < n_abstracts:
+            lines.append(f"  abstract: {p['abstract'][:1000]}")
+        for s in p["steps"]:
+            lines.append(f"  step: {s['input']} -> {s['process']} [{s['equipment']}] -> {s['output']}")
+    lab_text = "\n".join(f"- {name}: accepts {', '.join(e['accepts']) or '?'}; "
+                         f"produces {', '.join(e['produces']) or '?'}" for name, e in lab.items())
+    user = ("\n".join(lines) + f"\n\nLAB EQUIPMENT AND NOUNS:\n{lab_text}\n\n"
+            f"START: {start}" + (f" -- {start_desc}" if start_desc else "") + "\n"
+            f"END: {end}" + (f" -- {end_desc}" if end_desc else "") + "\n\n"
+            f"Propose up to {n} candidate sequences from START to END.")
+    return ask(engine, SYSTEM_PROMPT, user, Proposal).candidates, len(papers)
+
+
+# --------------------------------------------------------------------------
+# 2. The check: literature support + the lab
+# --------------------------------------------------------------------------
 
 STEP_QUERY = """
 UNWIND range(0, size($equipment) - 1) AS idx
@@ -191,7 +206,7 @@ WITH idx, $equipment[idx] AS want
 OPTIONAL MATCH (e:Equipment) WHERE toLower(e.name) = toLower(want)
 OPTIONAL MATCH (e)-[:ACCEPTS]->(a:Noun)
 OPTIONAL MATCH (e)-[:PRODUCES]->(p:Noun)
-RETURN idx, want, e IS NOT NULL AS found, e.name AS name,
+RETURN idx, e IS NOT NULL AS found, e.name AS name,
        e.available AS available, e.accessible AS accessible,
        collect(DISTINCT toLower(a.name)) AS accepts,
        collect(DISTINCT toLower(p.name)) AS produces
@@ -207,7 +222,7 @@ WITH q
 UNWIND range(0, size($routes) - 1) AS r
 WITH q, r, $routes[r] AS route
 CREATE (q)-[:FOUND {rank: r + 1}]->(rt:Route {summary: route.summary, rationale: route.rationale,
-                                              basis: route.basis})
+                                              basis: route.basis, source: route.source})
 WITH rt, route
 UNWIND range(0, size(route.steps) - 1) AS s
 WITH rt, s, route.steps[s] AS step
@@ -239,8 +254,7 @@ def validate(session, start: str, end: str, cand: Candidate, check_literature: b
         for i, s in enumerate(cand.steps, 1):
             if not any(c in known for c in s.citations):
                 problems.append(f"step {i} ({s.equipment}): no supporting paper in the library")
-            # keep only real citations, so made-up ids never reach Neo4j
-            s.citations = [c for c in s.citations if c in known]
+            s.citations = [c for c in s.citations if c in known]  # never store made-up ids
 
     facts = [r.data() for r in session.run(STEP_QUERY, equipment=[s.equipment for s in cand.steps])]
     incoming = start
@@ -269,7 +283,7 @@ def summary(start: str, cand: Candidate) -> str:
 
 
 # --------------------------------------------------------------------------
-# 4. Glue
+# 3. Glue
 # --------------------------------------------------------------------------
 
 def main() -> int:
@@ -278,70 +292,88 @@ def main() -> int:
     ap.add_argument("end", help="what you want to end with, e.g. 'tensile test specimen'")
     ap.add_argument("--start-desc", default="", help="description of the start object")
     ap.add_argument("--end-desc", default="", help="description of the end object")
-    ap.add_argument("-n", "--num", type=int, default=5, help="how many sequences to ask for (default 5)")
-    ap.add_argument("--papers", type=int, default=30, help="how many relevant papers to give Claude (default 30)")
-    ap.add_argument("--candidates", help="JSON file of candidate sequences to check instead of asking Claude")
+    ap.add_argument("--llm", choices=["none", "local", "claude"], default="none",
+                    help="also ask an AI for suggestions: local (free, Ollama) or claude (paid). Default: none")
+    ap.add_argument("-n", "--num", type=int, default=5, help="how many AI suggestions to ask for (default 5)")
+    ap.add_argument("--papers", type=int, help="papers given to the AI (default 12 local, 30 claude)")
+    ap.add_argument("--max-steps", type=int, default=10, help="longest literature chain to consider (default 10)")
+    ap.add_argument("--per-pair", type=int, default=20, help="literature chains per start/end match (default 20)")
+    ap.add_argument("--candidates", help="JSON file of candidate sequences to check as well")
+    ap.add_argument("--valid-only", action="store_true", help="list only valid candidates in the comparison")
     ap.add_argument("--show-rejected", action="store_true", help="also print rejected sequences in full")
-    ap.add_argument("--show-evidence", action="store_true", help="print the literature evidence given to Claude")
     ap.add_argument("--no-literature-check", action="store_true",
                     help="don't require each step to be backed by a paper")
     ap.add_argument("--no-save", action="store_true", help="don't save the valid routes in Neo4j")
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
     args = ap.parse_args()
 
+    if args.llm == "local":
+        try:
+            check_local()
+        except EngineError as e:
+            print(e, file=sys.stderr)
+            return 2
+
     driver = get_driver()
     with driver, driver.session(database=database()) as session:
         setup_schema(session)
-        lab = [r.data() for r in session.run(LAB_QUERY)]
-        if not any(e["accepts"] or e["produces"] for e in lab):
+        lab = {r["name"]: {"usable": r["usable"], "accepts": [a.lower() for a in r["accepts"]],
+                           "produces": [p.lower() for p in r["produces"]]} for r in session.run(LAB_QUERY)}
+        if not any(e["accepts"] or e["produces"] for e in lab.values()):
             print("No lab equipment with ACCEPTS/PRODUCES links in Neo4j. Load it first, e.g. with seed.cypher.",
                   file=sys.stderr)
             return 2
         n_read = session.run("MATCH (p:Paper) WHERE p.extracted RETURN count(p) AS n").single()["n"]
         check_lit = not args.no_literature_check and n_read > 0
-        if n_read == 0 and not args.no_literature_check:
-            print("note: the literature library is empty or unread, so the literature check is off. "
-                  "Run harvest_literature.py and extract_knowledge.py to turn it on.", file=sys.stderr)
+        if n_read == 0:
+            print("note: the literature library is empty or unread; run harvest_literature.py and "
+                  "extract_knowledge.py. The literature check is off.", file=sys.stderr)
 
-        # 1-2. evidence and candidates
-        evidence = gather_evidence(session, args.start, args.start_desc, args.end, args.end_desc, args.papers)
-        ev_text = evidence_text(evidence)
-        if args.show_evidence:
-            print(ev_text + "\n")
+        # 1. candidates, tagged with where they came from
+        candidates: list[tuple[str, Candidate]] = []
+        if n_read:
+            for c in graph_candidates(session, args.start, args.start_desc, args.end, args.end_desc,
+                                      lab, args.per_pair, args.max_steps):
+                candidates.append(("literature", c))
+        n_papers = 0
+        if args.llm != "none":
+            k = args.papers or (30 if args.llm == "claude" else 12)
+            try:
+                found, n_papers = llm_candidates(session, args.llm, args.start, args.start_desc, args.end,
+                                                 args.end_desc, lab, args.num, k)
+                tag = "claude" if args.llm == "claude" else "local AI"
+                candidates += [(tag, c) for c in found]
+            except EngineError as e:
+                print(f"note: AI suggestions skipped: {e}", file=sys.stderr)
         if args.candidates:
             with open(args.candidates) as fh:
-                candidates = [Candidate(**c) for c in json.load(fh)]
-        else:
-            candidates = propose_sequences(anthropic.Anthropic(), args.start, args.start_desc, args.end,
-                                           args.end_desc, lab, ev_text, args.num)
+                candidates += [("file", Candidate(**c)) for c in json.load(fh)]
 
-        # 3. check each
-        results = [(c, validate(session, args.start, args.end, c, check_lit)) for c in candidates]
-        valid = [c for c, p in results if not p]
+        # 2. check each; valid first, then shorter, then better supported
+        results = [(src, c, validate(session, args.start, args.end, c, check_lit)) for src, c in candidates]
+        results.sort(key=lambda r: (bool(r[2]), len(r[1].steps),
+                                    -len({x for s in r[1].steps for x in s.citations})))
+        valid = [(src, c) for src, c, p in results if not p]
 
-        # save the valid ones in Neo4j
         if valid and not args.no_save:
             routes = []
-            for c in valid:
+            for src, c in valid:
                 inputs = [args.start] + [s.output for s in c.steps[:-1]]
-                routes.append({
-                    "summary": summary(args.start, c), "rationale": c.rationale, "basis": c.basis,
-                    "steps": [{**s.model_dump(), "input": i} for s, i in zip(c.steps, inputs)],
-                })
+                routes.append({"summary": summary(args.start, c), "rationale": c.rationale, "basis": c.basis,
+                               "source": src,
+                               "steps": [{**s.model_dump(), "input": i} for s, i in zip(c.steps, inputs)]})
             session.run(SAVE_QUERY, start=args.start, start_desc=args.start_desc, end=args.end,
                         end_desc=args.end_desc, routes=routes).consume()
-        titles = {p["id"]: f"{p['title']} ({p['year']})" for p in evidence["papers"]}
-        cited = sorted({x for c in valid for s in c.steps for x in s.citations} - set(titles))
-        if cited:
-            for r in session.run("MATCH (p:Paper) WHERE p.id IN $ids RETURN p.id AS id, p.title AS t, p.year AS y",
-                                 ids=cited):
-                titles[r["id"]] = f"{r['t']} ({r['y']})"
+
+        cited = sorted({x for _, c, _ in results for s in c.steps for x in s.citations})
+        titles = {r["id"]: f"{r['t']} ({r['y']})" for r in session.run(
+            "MATCH (p:Paper) WHERE p.id IN $ids RETURN p.id AS id, p.title AS t, p.year AS y", ids=cited)}
 
     if args.json:
         print(json.dumps({
             "start": args.start, "start_desc": args.start_desc, "end": args.end, "end_desc": args.end_desc,
-            "papers_used": len(evidence["papers"]),
-            "candidates": [{**c.model_dump(), "valid": not p, "problems": p} for c, p in results],
+            "candidates": [{**c.model_dump(), "source": src, "valid": not p, "problems": p}
+                           for src, c, p in results],
         }, indent=2))
         return 0 if valid else 1
 
@@ -349,40 +381,51 @@ def main() -> int:
     print(f"\n{args.start}  ->  {args.end}")
     if args.start_desc or args.end_desc:
         print(f"  start: {args.start_desc or '-'}\n  end:   {args.end_desc or '-'}")
-    print(f"{len(evidence['papers'])} relevant papers, {len(evidence['chains'])} literature chains used\n")
-    print(f"  {'#':>2}  {'result':<8} {'steps':>5} {'papers':>6}  route")
-    for i, (c, p) in enumerate(results, 1):
-        n_papers = len({x for s in c.steps for x in s.citations})
+    by_src = {}
+    for src, _, _ in results:
+        by_src[src] = by_src.get(src, 0) + 1
+    print(f"{len(results)} candidates (" + ", ".join(f"{n} from {s}" for s, n in by_src.items())
+          + f"), {len(valid)} valid in this lab\n")
+    if not results:
+        print("  No candidates found. Check that map_names.py has matched your start and end,\n"
+              "  or try --llm local for AI suggestions.\n")
+        return 1
+    print(f"  {'#':>2}  {'result':<8} {'source':<10} {'steps':>5} {'papers':>6}  route")
+    for i, (src, c, p) in enumerate(results, 1):
+        if args.valid_only and p:
+            continue
+        n_p = len({x for s in c.steps for x in s.citations})
         route = " > ".join(s.equipment for s in c.steps)
-        print(f"  {i:>2}  {'VALID' if not p else 'rejected':<8} {len(c.steps):>5} {n_papers:>6}  {route}")
+        print(f"  {i:>2}  {'VALID' if not p else 'rejected':<8} {src:<10} {len(c.steps):>5} {n_p:>6}  {route}")
         if p:
-            print(f"{'':20}why rejected: {p[0]}" + (f" (+{len(p) - 1} more)" if len(p) > 1 else ""))
+            print(f"{'':31}why rejected: {p[0]}" + (f" (+{len(p) - 1} more)" if len(p) > 1 else ""))
     print()
 
-    def show(c: Candidate, marker: str, problems: list[str]) -> None:
-        print(f"  {marker} {args.start}")
+    def show(c: Candidate, marker: str, src: str, problems: list[str]) -> None:
+        print(f"  {marker} {args.start}   (from {src})")
         for i, s in enumerate(c.steps, 1):
             print(f"        {i}. [{s.equipment}] {s.process}  ->  {s.output}")
-            for pid in s.citations:
+            for pid in s.citations[:3]:
                 print(f"             {pid}: {titles.get(pid, '')}")
-        print(f"      why:   {c.rationale}")
-        print(f"      basis: {c.basis}")
+            if len(s.citations) > 3:
+                print(f"             ... and {len(s.citations) - 3} more papers")
+        if src != "literature":
+            print(f"      why:   {c.rationale}")
+            print(f"      basis: {c.basis}")
         for x in problems:
             print(f"      - {x}")
         print()
 
     if valid:
         print("Valid sequences:\n")
-        for i, (c, p) in enumerate([(c, p) for c, p in results if not p], 1):
-            show(c, f"[{i}]", p)
+        for i, (src, c) in enumerate(valid, 1):
+            show(c, f"[{i}]", src, [])
     else:
-        print("None of the proposed sequences can be run in this lab right now.\n")
+        print("None of the candidates can be run in this lab right now.\n")
     if args.show_rejected:
-        rejected = [(c, p) for c, p in results if p]
-        if rejected:
-            print("Rejected sequences:\n")
-            for c, p in rejected:
-                show(c, "x", p)
+        for src, c, p in results:
+            if p:
+                show(c, "x", src, p)
     if valid and not args.no_save:
         print("Saved in Neo4j. View them, with their supporting papers, in the Neo4j Browser:")
         print("  MATCH (q:RouteQuery)-[f:FOUND]->(r:Route)-[s:STEP]->(st:Step)-[u]->(x) RETURN q, f, r, s, st, u, x\n")
